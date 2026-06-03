@@ -3,6 +3,7 @@ fastapi
 uvicorn[standard]
 httpx
 mangum
+itsdangerous
 
 # environment variables
 python-dotenv

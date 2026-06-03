@@ -117,14 +117,20 @@ def is_admin_login_configured() -> bool:
     return bool(list_admin_login_users() or AUTH_CONFIGURED)
 
 
+def _request_session(request: Request) -> dict:
+    if "session" not in request.scope:
+        return {}
+    return request.session
+
+
 def is_admin_session_authenticated(request: Request) -> bool:
-    session = getattr(request, "session", None) or {}
+    session = _request_session(request)
     payload = session.get(ADMIN_SESSION_KEY)
     return bool(isinstance(payload, dict) and payload.get("authenticated"))
 
 
 def _get_admin_session_payload(request: Request) -> dict:
-    session = getattr(request, "session", None) or {}
+    session = _request_session(request)
     payload = session.get(ADMIN_SESSION_KEY)
     return payload if isinstance(payload, dict) else {}
 
