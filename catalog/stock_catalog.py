@@ -6,7 +6,7 @@ import logging
 import os
 from pathlib import Path
 import re
-from typing import Dict, List
+from typing import Dict, Iterable, List
 from urllib.parse import quote
 
 from .product_media import (
@@ -18,11 +18,18 @@ from .product_media import (
     _normalize_name_for_match,
     _pick_distinct_fallback,
 )
+from .technical_specs import resolve_technical_specs
 
 
 logger = logging.getLogger(__name__)
 
 STOCK_REPORT_SHEET_NAME = "POSICAO_ESTOQUE"
+STOCK_REPORT_CODE_INDEX = 1
+STOCK_REPORT_DESCRIPTION_INDEX = 2
+STOCK_REPORT_MONTHLY_SALES_INDEX = 13
+STOCK_REPORT_MONTHLY_SALES_1_INDEX = 14
+STOCK_REPORT_MONTHLY_SALES_2_INDEX = 15
+STOCK_REPORT_MONTHLY_SALES_3_INDEX = 16
 NO_PHOTO_COVER_URL = "https://placehold.co/900x700?text=Sem+Imagem"
 NO_PHOTO_THUMB_URL = "https://placehold.co/240x240?text=Sem+foto"
 STOCK_PHOTO_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".psd")
@@ -48,6 +55,23 @@ DESCRIPTION_TOKEN_STOPWORDS = {
     "und",
     "kit",
 }
+
+
+def _stringify(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _is_placeholder_photo_url(value: object) -> bool:
+    text = _stringify(value).lower()
+    return not text or "placehold.co" in text or "sem+imagem" in text or "sem+foto" in text
+
+
+def _first_real_photo_url(*values: object) -> str:
+    for value in values:
+        text = _stringify(value)
+        if text and not _is_placeholder_photo_url(text):
+            return text
+    return ""
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -114,11 +138,141 @@ def _normalize_stock_code(raw_code: object) -> str | None:
     return None
 
 
+def _normalize_stock_metric(raw_value: object) -> int | float:
+    if raw_value is None or isinstance(raw_value, bool):
+        return 0
+    if isinstance(raw_value, int):
+        return raw_value
+    if isinstance(raw_value, float):
+        return int(raw_value) if raw_value.is_integer() else raw_value
+
+    text = str(raw_value).strip()
+    if not text:
+        return 0
+
+    normalized = text.replace(" ", "")
+    if "," in normalized and "." in normalized:
+        if normalized.rfind(",") > normalized.rfind("."):
+            normalized = normalized.replace(".", "").replace(",", ".")
+        else:
+            normalized = normalized.replace(",", "")
+    elif "," in normalized:
+        normalized = normalized.replace(".", "").replace(",", ".")
+
+    try:
+        parsed = float(normalized)
+    except ValueError:
+        return 0
+    return int(parsed) if parsed.is_integer() else parsed
+
+
+def _stock_metric_value(row: tuple[object, ...], index: int) -> int | float:
+    return _normalize_stock_metric(row[index] if len(row) > index else None)
+
+
+def _extract_stock_sales_fields(row: tuple[object, ...]) -> Dict[str, int | float]:
+    return {
+        "VendaMes": _stock_metric_value(row, STOCK_REPORT_MONTHLY_SALES_INDEX),
+        "VendaMes1": _stock_metric_value(row, STOCK_REPORT_MONTHLY_SALES_1_INDEX),
+        "VendaMes2": _stock_metric_value(row, STOCK_REPORT_MONTHLY_SALES_2_INDEX),
+        "VendaMes3": _stock_metric_value(row, STOCK_REPORT_MONTHLY_SALES_3_INDEX),
+    }
+
+
 def _placeholder_urls_for_code(code: str) -> tuple[str, str]:
     safe_code = quote(str(code), safe="")
     cover = f"{NO_PHOTO_COVER_URL}+{safe_code}"
     thumb = f"{NO_PHOTO_THUMB_URL}+{safe_code}"
     return cover, thumb
+
+
+def _load_stock_sales_index(report_path: str, codes: Iterable[object] | None = None) -> Dict[str, Dict[str, int | float]]:
+    if not report_path or not os.path.isfile(report_path):
+        return {}
+
+    normalized_codes = (
+        {
+            normalized
+            for normalized in (_normalize_stock_code(item) for item in (codes or []))
+            if normalized
+        }
+        if codes is not None
+        else None
+    )
+
+    try:
+        from openpyxl import load_workbook
+    except Exception as exc:
+        logger.warning("Unable to import openpyxl for stock sales index: %s", exc)
+        return {}
+
+    try:
+        workbook = load_workbook(report_path, read_only=True, data_only=True)
+    except Exception as exc:
+        logger.warning("Failed to open stock report '%s' for sales index: %s", report_path, exc)
+        return {}
+
+    try:
+        if STOCK_REPORT_SHEET_NAME not in workbook.sheetnames:
+            return {}
+
+        worksheet = workbook[STOCK_REPORT_SHEET_NAME]
+        sales_index: Dict[str, Dict[str, int | float]] = {}
+
+        for row in worksheet.iter_rows(min_row=2, values_only=True):
+            code = _normalize_stock_code(row[STOCK_REPORT_CODE_INDEX] if len(row) > STOCK_REPORT_CODE_INDEX else None)
+            if not code:
+                continue
+            if normalized_codes is not None and code not in normalized_codes:
+                continue
+
+            entry = sales_index.setdefault(
+                code,
+                {
+                    "VendaMes": 0,
+                    "VendaMes1": 0,
+                    "VendaMes2": 0,
+                    "VendaMes3": 0,
+                },
+            )
+            for field, value in _extract_stock_sales_fields(row).items():
+                entry[field] = _normalize_stock_metric(entry.get(field)) + _normalize_stock_metric(value)
+
+        return sales_index
+    finally:
+        workbook.close()
+
+
+def load_stock_sales_index(codes: Iterable[object] | None = None) -> Dict[str, Dict[str, int | float]]:
+    for candidate in _candidate_stock_report_paths():
+        loaded = _load_stock_sales_index(candidate, codes=codes)
+        if loaded:
+            return loaded
+    return {}
+
+
+def merge_products_with_stock_sales(products: List[Dict]) -> List[Dict]:
+    if not products:
+        return products
+
+    sales_index = load_stock_sales_index(product.get("Codigo") for product in products)
+    if not sales_index:
+        return products
+
+    merged_products: List[Dict] = []
+    for product in products:
+        code = _normalize_stock_code(product.get("Codigo"))
+        extra = sales_index.get(code or "")
+        if not extra:
+            merged_products.append(product)
+            continue
+
+        merged = dict(product)
+        for field, value in extra.items():
+            merged[field] = value
+        merged_products.append(merged)
+
+    return merged_products
 
 
 def _resolve_stock_photos_root(path_override: str | None = None) -> str | None:
@@ -419,14 +573,20 @@ def _enrich_stock_products_with_photos(products: List[Dict]) -> List[Dict]:
         ambient = variants.get("ambient")
         measures = variants.get("measures")
 
-        white_url = _asset_url(white["rel_path"]) if white else merged.get("URLFoto", "")
-        ambient_url = _asset_url(ambient["rel_path"]) if ambient else merged.get("FotoAmbient", "")
-        measures_url = _asset_url(measures["rel_path"]) if measures else merged.get("FotoMedidas", "")
+        current_cover = _stringify(merged.get("URLFoto"))
+        current_white = _stringify(merged.get("FotoBranco")) or current_cover
+        current_ambient = _stringify(merged.get("FotoAmbient"))
+        current_measures = _stringify(merged.get("FotoMedidas"))
 
-        merged["URLFoto"] = white_url
-        merged["FotoBranco"] = white_url
-        merged["FotoAmbient"] = ambient_url
-        merged["FotoMedidas"] = measures_url
+        white_url = _asset_url(white["rel_path"]) if white else current_white
+        ambient_url = _asset_url(ambient["rel_path"]) if ambient else current_ambient
+        measures_url = _asset_url(measures["rel_path"]) if measures else current_measures
+        cover_url = _first_real_photo_url(ambient_url, white_url, measures_url, current_cover) or current_cover
+
+        merged["URLFoto"] = cover_url
+        merged["FotoBranco"] = _first_real_photo_url(white_url, cover_url) or current_white or cover_url
+        merged["FotoAmbient"] = _first_real_photo_url(ambient_url) or current_ambient
+        merged["FotoMedidas"] = _first_real_photo_url(measures_url) or current_measures
         enriched.append(merged)
 
     return enriched
@@ -487,12 +647,12 @@ def _load_products_from_stock_report(report_path: str) -> List[Dict]:
             worksheet.iter_rows(min_row=2, values_only=True),
             start=2,
         ):
-            raw_code = row[1] if len(row) > 1 else None
+            raw_code = row[STOCK_REPORT_CODE_INDEX] if len(row) > STOCK_REPORT_CODE_INDEX else None
             code = _normalize_stock_code(raw_code)
             if not code:
                 continue
 
-            raw_description = row[2] if len(row) > 2 else ""
+            raw_description = row[STOCK_REPORT_DESCRIPTION_INDEX] if len(row) > STOCK_REPORT_DESCRIPTION_INDEX else ""
             description = re.sub(r"\s+", " ", str(raw_description or "")).strip()
             if not description:
                 description = f"Produto {code}"
@@ -509,10 +669,16 @@ def _load_products_from_stock_report(report_path: str) -> List[Dict]:
                         "Descricao": description,
                         "Categoria": category,
                         "URLFoto": cover_url,
-                        "Especificacoes": "",
+                        "Especificacoes": resolve_technical_specs(
+                            code=code,
+                            name=description,
+                            description=description,
+                            category=category,
+                        ),
                         "FotoBranco": thumb_url,
                         "FotoAmbient": thumb_url,
                         "FotoMedidas": thumb_url,
+                        **_extract_stock_sales_fields(row),
                     },
                 )
             )

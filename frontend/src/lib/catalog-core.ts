@@ -1,4 +1,4 @@
-import type { SyntheticEvent } from "react";
+﻿import type { SyntheticEvent } from "react";
 
 const DEFAULT_API_BASES = ["", "http://127.0.0.1:8000", "http://127.0.0.1:5000"];
 

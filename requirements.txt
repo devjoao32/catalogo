@@ -2,6 +2,7 @@
 fastapi
 uvicorn[standard]
 httpx
+mangum
 
 # environment variables
 python-dotenv
@@ -9,6 +10,7 @@ python-dotenv
 # HTTP utilities
 requests
 beautifulsoup4
+boto3
 
 # Microsoft Graph auth
 msal
@@ -17,6 +19,7 @@ msal
 pandas
 openpyxl
 Pillow
+psycopg[binary]
 
 # testing
 pytest

@@ -1,13 +1,15 @@
-import { UI_STATE_STORAGE_KEY } from "./catalog-core";
+﻿import { UI_STATE_STORAGE_KEY } from "./catalog-core";
 
 export interface PersistedUiState {
   query: string;
   category: string;
+  brand: "nitrolux" | "pienza";
 }
 
 const FALLBACK_STATE: PersistedUiState = {
   query: "",
   category: "Todas",
+  brand: "nitrolux",
 };
 
 export function readPersistedUiState(): PersistedUiState {
@@ -26,6 +28,7 @@ export function readPersistedUiState(): PersistedUiState {
         typeof parsed.category === "string" && parsed.category
           ? parsed.category
           : FALLBACK_STATE.category,
+      brand: parsed.brand === "pienza" ? "pienza" : FALLBACK_STATE.brand,
     };
   } catch (error) {
     console.warn("Não foi possível ler estado de UI persistido.", error);

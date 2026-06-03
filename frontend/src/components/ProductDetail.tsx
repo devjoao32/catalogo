@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
+﻿import { useEffect, useState } from "react";
 
 import ExportActions from "./ExportActions";
 import type { CatalogExportFormat, CatalogProduct, GalleryEntry, ProductPhotos } from "../types";
 import { DETAIL_FALLBACK_IMAGE, THUMB_FALLBACK_IMAGE, setFallbackImage } from "../lib/catalog-core";
 import { downloadImageFile } from "../lib/catalog-api";
-import { buildGalleryEntries } from "../lib/catalog-products";
+import { buildGalleryEntries, findPreferredGalleryIndex } from "../lib/catalog-products";
 
 interface ProductDetailProps {
   item: CatalogProduct;
@@ -36,11 +36,14 @@ export default function ProductDetail({
   const [activeIndex, setActiveIndex] = useState(0);
   const gallery =
     galleryEntries && galleryEntries.length > 0 ? galleryEntries : buildGalleryEntries(item, photos, []);
-  const activeImage = gallery[activeIndex] || gallery[0] || null;
+  const preferredGalleryIndex = findPreferredGalleryIndex(gallery);
+  const galleryResetKey = gallery.map((entry) => entry.key || entry.url || entry.label).join("|");
+  const currentIndex = activeIndex >= 0 && activeIndex < gallery.length ? activeIndex : preferredGalleryIndex;
+  const activeImage = gallery[currentIndex] || gallery[preferredGalleryIndex] || gallery[0] || null;
 
   useEffect(() => {
-    setActiveIndex(0);
-  }, [item.routeId]);
+    setActiveIndex(preferredGalleryIndex);
+  }, [item.routeId, galleryResetKey, preferredGalleryIndex]);
 
   const downloadSelectedImage = () => {
     if (!activeImage?.url) return;
@@ -72,14 +75,16 @@ export default function ProductDetail({
         <aside className="detail-meta">
           <h2>{item.name || "Produto"}</h2>
           <div className="detail-tags">
+            <span className="detail-tag">{item.brandLabel}</span>
             <span className="detail-tag">Código: {item.code}</span>
             <span className="detail-tag">{item.category || "Sem categoria"}</span>
           </div>
           <ExportActions
             title="Baixar este produto"
-            note="Exporte em planilha, PDF, JSON ou ZIP com as fotos disponíveis."
+            note="Baixe a ficha técnica em PDF ou exporte os dados e fotos do produto."
             onExport={onExport}
             compact
+            includeTechnicalSheet
           />
           <p>{item.description || "Descrição indisponível para este produto."}</p>
           <p>{item.specs || "Sem especificações técnicas cadastradas."}</p>
@@ -121,9 +126,9 @@ export default function ProductDetail({
           <button
             key={image.key || `${image.label}-${idx}`}
             type="button"
-            className={`detail-gallery-btn ${idx === activeIndex ? "is-active" : ""}`}
+            className={`detail-gallery-btn ${idx === currentIndex ? "is-active" : ""}`}
             onClick={() => setActiveIndex(idx)}
-            aria-pressed={idx === activeIndex}
+            aria-pressed={idx === currentIndex}
             aria-label={`Selecionar ${image.label}`}
           >
             <img

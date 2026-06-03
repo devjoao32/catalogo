@@ -4,7 +4,7 @@ from io import BytesIO
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from catalog.api.errors import internal_server_error_response
@@ -12,6 +12,8 @@ from catalog.api.endpoints.catalog import router as catalog_data_router
 from catalog.api.endpoints.erp import router as erp_router
 from catalog.api.endpoints.export import router as export_router
 from catalog.api.endpoints.media import router as media_router
+from catalog.api.endpoints.representatives import router as representatives_router
+from catalog.api.security import require_representative_access
 from catalog.local_catalog import IMG_EXTENSIONS
 
 
@@ -20,6 +22,7 @@ router.include_router(catalog_data_router)
 router.include_router(media_router)
 router.include_router(erp_router)
 router.include_router(export_router)
+router.include_router(representatives_router)
 logger = logging.getLogger(__name__)
 CONVERTIBLE_LOCAL_ASSET_EXTENSIONS = {".psd", ".heic", ".heif"}
 
@@ -52,7 +55,7 @@ def _tiff_to_jpeg_bytes(asset_path: str) -> bytes | None:
             return output.getvalue()
     except Exception:
         return None
-@router.get("/local/asset")
+@router.get("/local/asset", dependencies=[Depends(require_representative_access)])
 async def local_asset(path: str | None = None):
     """Serve um arquivo de imagem local da pasta de produtos configurada no OneDrive."""
     if not path:

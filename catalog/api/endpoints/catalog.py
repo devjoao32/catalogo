@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
 from ..errors import internal_server_error_response
+from ..security import require_representative_access
 from ..schemas import CatalogProductSchema
 from ...services import fetch_sheet_or_local_products, list_catalog_products
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_representative_access)])
 logger = logging.getLogger(__name__)
 
 

@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Catalogo serverless stack with S3 frontend, API Gateway, Lambda, Cognito and DynamoDB.
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+  FrontendBucketName:
+    Type: String
+    Default: ""
+  MediaBucketName:
+    Type: String
+    Default: ""
+  MediaPrefix:
+    Type: String
+    Default: "produtos/"
+  CorsAllowOrigins:
+    Type: String
+    Default: "http://localhost:5173"
+  CatalogSessionSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: Secret with at least 32 characters used to sign admin sessions and representative JWTs.
+  GoogleDriveFolderId:
+    Type: String
+    Default: ""
+  GoogleDriveApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+
+Conditions:
+  HasFrontendBucketName: !Not [!Equals [!Ref FrontendBucketName, ""]]
+  HasMediaBucketName: !Not [!Equals [!Ref MediaBucketName, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    Timeout: 30
+    MemorySize: 1024
+    Tracing: Active
+    Environment:
+      Variables:
+        CATALOG_ENABLE_API_DOCS: "false"
+        CATALOG_CORS_ALLOW_ORIGINS: !Ref CorsAllowOrigins
+        CATALOG_CORS_ALLOW_CREDENTIALS: "true"
+        CATALOG_SESSION_SECRET: !Ref CatalogSessionSecret
+        CATALOG_SESSION_COOKIE_SECURE: "true"
+        CATALOG_GOOGLE_DRIVE_FOLDER_ID: !Ref GoogleDriveFolderId
+        CATALOG_GOOGLE_DRIVE_API_KEY: !Ref GoogleDriveApiKey
+        CATALOG_GOOGLE_DRIVE_RECURSIVE: "true"
+        CATALOG_GOOGLE_DRIVE_MAX_DEPTH: "4"
+        CATALOG_S3_MEDIA_BUCKET: !Ref MediaBucket
+        CATALOG_S3_MEDIA_PREFIX: !Ref MediaPrefix
+        CATALOG_S3_MEDIA_PRESIGNED_URLS: "false"
+        CATALOG_DATA_TABLE_NAME: !Ref CatalogDataTable
+
+Resources:
+  CatalogHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+      CorsConfiguration:
+        AllowCredentials: true
+        AllowHeaders:
+          - "*"
+        AllowMethods:
+          - "*"
+        AllowOrigins:
+          - !Ref CorsAllowOrigins
+
+  CatalogApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: catalog.lambda_handler.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CatalogDataTable
+        - S3ReadPolicy:
+            BucketName: !Ref MediaBucket
+      Events:
+        Root:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CatalogHttpApi
+            Path: /
+            Method: ANY
+        Proxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CatalogHttpApi
+            Path: /{proxy+}
+            Method: ANY
+
+  CatalogDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+
+  CatalogUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+
+  CatalogUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${AWS::StackName}-web"
+      UserPoolId: !Ref CatalogUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If [HasMediaBucketName, !Ref MediaBucketName, !Ref AWS::NoValue]
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - GET
+              - HEAD
+            AllowedOrigins:
+              - "*"
+            MaxAge: 3000
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadCatalogImages
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${MediaBucket.Arn}/*"
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If [HasFrontendBucketName, !Ref FrontendBucketName, !Ref AWS::NoValue]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadFrontend
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway URL
+    Value: !Sub "https://${CatalogHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+  FrontendBucket:
+    Description: S3 bucket for frontend build files
+    Value: !Ref FrontendBucket
+  FrontendWebsiteUrl:
+    Description: S3 static website endpoint
+    Value: !GetAtt FrontendBucket.WebsiteURL
+  MediaBucketName:
+    Description: S3 bucket for product images
+    Value: !Ref MediaBucket
+  MediaPrefix:
+    Description: Prefix used by the API to list product images
+    Value: !Ref MediaPrefix
+  CognitoUserPoolId:
+    Description: Cognito user pool ID reserved for the next auth migration step
+    Value: !Ref CatalogUserPool
+  CognitoUserPoolClientId:
+    Description: Cognito web client ID
+    Value: !Ref CatalogUserPoolClient
+  DynamoDBTableName:
+    Description: DynamoDB table reserved for catalog data migration
+    Value: !Ref CatalogDataTable

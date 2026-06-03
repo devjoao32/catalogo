@@ -116,7 +116,16 @@ def test_product_images_local_mode_without_photos(monkeypatch):
 def test_local_products_route(monkeypatch):
     monkeypatch.setattr(
         'catalog.onedrive.list_local_products',
-        lambda: [{'Codigo': '5989', 'Nome': 'Produto', 'Categoria': 'ABAJUR'}]
+        lambda: [
+            {
+                'Codigo': '5989',
+                'Nome': 'Produto',
+                'Categoria': 'ABAJUR',
+                'VendaMes': 87,
+                'Embalagem': '6',
+                'CaixaMaster': '24',
+            }
+        ]
     )
     client = TestClient(app)
     rv = client.get('/catalog/local/produtos')
@@ -124,6 +133,72 @@ def test_local_products_route(monkeypatch):
     data = rv.json()
     assert isinstance(data, list)
     assert data[0]['Codigo'] == '5989'
+    assert data[0]['VendaMes'] == 87
+    assert data[0]['Embalagem'] == '6'
+    assert data[0]['CaixaMaster'] == '24'
+
+
+def test_representative_admin_routes_manage_users(monkeypatch, tmp_path):
+    managed_path = tmp_path / "representatives.json"
+    monkeypatch.setenv("CATALOG_ADMIN_LOGIN_EMAIL", "")
+    monkeypatch.setenv("CATALOG_ADMIN_LOGIN_PASSWORD", "")
+    monkeypatch.setenv("CATALOG_ERP_ADMIN_TOKEN", "")
+    monkeypatch.setenv("CATALOG_REPRESENTATIVE_LOGIN_EMAIL", "env@example.com")
+    monkeypatch.setenv("CATALOG_REPRESENTATIVE_LOGIN_PASSWORD", "env-secret")
+    monkeypatch.setenv("CATALOG_REPRESENTATIVE_LOGIN_NAME", "Equipe Ambiente")
+    monkeypatch.setenv("CATALOG_REPRESENTATIVE_USERS_JSON", "")
+    monkeypatch.setenv("CATALOG_REPRESENTATIVE_USERS_FILE", str(managed_path))
+
+    client = TestClient(app)
+
+    initial = client.get("/catalog/representatives")
+    assert initial.status_code == 200
+    initial_payload = initial.json()
+    assert initial_payload["total_users"] == 1
+    assert initial_payload["environment_users"] == 1
+    assert initial_payload["managed_users"] == 0
+    assert initial_payload["users"][0]["email"] == "env@example.com"
+    assert initial_payload["users"][0]["managed"] is False
+
+    created = client.put(
+        "/catalog/representatives/rep@example.com",
+        json={"email": "rep@example.com", "name": "Representante Recife", "password": "rep-secret"},
+    )
+    assert created.status_code == 200
+    created_payload = created.json()
+    assert created_payload["created"] is True
+    assert created_payload["managed_users"] == 1
+    assert any(user["email"] == "rep@example.com" and user["managed"] for user in created_payload["users"])
+
+    stored_payload = managed_path.read_text(encoding="utf-8")
+    assert "rep@example.com" in stored_payload
+    assert "rep-secret" not in stored_payload
+    assert "password_hash" in stored_payload
+
+    updated = client.put(
+        "/catalog/representatives/rep@example.com",
+        json={"email": "rep@example.com", "name": "Representante Nordeste"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["created"] is False
+    assert any(
+        user["email"] == "rep@example.com" and user["name"] == "Representante Nordeste"
+        for user in updated.json()["users"]
+    )
+
+    conflict = client.put(
+        "/catalog/representatives/env@example.com",
+        json={"email": "env@example.com", "name": "Duplicado", "password": "new-secret"},
+    )
+    assert conflict.status_code == 400
+    assert conflict.json()["error"] == "Representative email is managed by environment configuration"
+
+    deleted = client.delete("/catalog/representatives/rep@example.com")
+    assert deleted.status_code == 200
+    deleted_payload = deleted.json()
+    assert deleted_payload["deleted"] is True
+    assert deleted_payload["managed_users"] == 0
+    assert all(user["email"] != "rep@example.com" for user in deleted_payload["users"])
 
 
 def test_local_asset_route(monkeypatch, tmp_path):
@@ -184,6 +259,10 @@ def test_erp_import_and_status(monkeypatch):
     data = status.json()
     assert data['exists'] is True
     assert data['products_loaded'] == 1
+    assert data['last_change_summary']['added_count'] == 1
+    assert data['last_change_summary']['updated_count'] == 0
+    assert data['last_change_summary']['removed_count'] == 0
+    assert data['last_change_summary']['unchanged_count'] == 0
 
     if os.path.exists(target_path):
         os.remove(target_path)
@@ -246,10 +325,14 @@ def test_erp_upload_raw_json(monkeypatch):
     data = rv.json()
     assert data['products_imported'] == 1
     assert os.path.exists(data['uploaded_path'])
+    assert data['source_name'] == 'pcprodut_upload.json'
 
     status = client.get('/catalog/erp/status')
     assert status.status_code == 200
-    assert status.json()['products_loaded'] == 1
+    status_payload = status.json()
+    assert status_payload['products_loaded'] == 1
+    assert status_payload['source_name'] == 'pcprodut_upload.json'
+    assert status_payload['source_path'].endswith('pcprodut_upload.json')
 
     if os.path.exists(target_path):
         os.remove(target_path)
@@ -293,13 +376,21 @@ def test_erp_import_file_endpoint(monkeypatch):
     data = rv.json()
     assert data['products_imported'] == 1
     assert data['source_path'].endswith('_test_erp_source.json')
+    assert data['source_name'] == '_test_erp_source.json'
     assert os.path.exists(target_path)
+
+    status = client.get('/catalog/erp/status')
+    assert status.status_code == 200
+    status_payload = status.json()
+    assert status_payload['source_path'].endswith('_test_erp_source.json')
+    assert status_payload['source_name'] == '_test_erp_source.json'
 
     files = client.get('/catalog/erp/files')
     assert files.status_code == 200
     payload = files.json()
     assert 'files' in payload
     assert any(item['is_active'] for item in payload['files'])
+    assert any(item['is_deployed_source'] for item in payload['files'] if item['name'] == '_test_erp_source.json')
 
     for path in (source_path, target_path):
         if os.path.exists(path):
@@ -311,6 +402,67 @@ def test_erp_import_file_rejects_path_traversal():
     rv = client.post('/catalog/erp/import-file', json={'file_path': '..\\app.py'})
     assert rv.status_code == 400
     assert 'error' in rv.json()
+
+
+def test_erp_stage_file_and_preview(monkeypatch):
+    target_path = os.path.join(os.getcwd(), 'reports', '_test_erp_stage_target.json')
+    inbox_dir = os.path.join(os.getcwd(), 'reports', '_test_erp_stage_inbox')
+
+    if os.path.exists(target_path):
+        os.remove(target_path)
+    if os.path.isdir(inbox_dir):
+        for entry in os.listdir(inbox_dir):
+            os.remove(os.path.join(inbox_dir, entry))
+        os.rmdir(inbox_dir)
+
+    monkeypatch.setenv('CATALOG_ERP_JSON_PATH', target_path)
+    monkeypatch.setenv('CATALOG_ERP_INBOX_DIR', inbox_dir)
+
+    client = TestClient(app)
+    body = (
+        '{"products":['
+        '{"codigo":"1101","nome":"Produto Staged","categoria":"ARANDELA"},'
+        '{"codigo":"1102","nome":"Produto Dois","categoria":"PAINEL"}'
+        ']}'
+    )
+    rv = client.post(
+        '/catalog/erp/stage-file',
+        params={'filename': 'pcprodut_stage.json'},
+        content=body.encode('utf-8'),
+        headers={'Content-Type': 'application/json'},
+    )
+    assert rv.status_code == 200
+    staged = rv.json()
+    assert staged['staged'] is True
+    assert staged['products_loaded'] == 2
+    assert staged['name'] == 'pcprodut_stage.json'
+    assert staged['is_active'] is False
+    assert os.path.exists(staged['path'])
+
+    preview = client.get('/catalog/erp/files/preview', params={'file_path': staged['path']})
+    assert preview.status_code == 200
+    payload = preview.json()
+    assert payload['products_loaded'] == 2
+    assert payload['records_detected'] == 2
+    assert payload['ignored_records'] == 0
+    assert payload['categories'][0]['count'] >= 1
+    assert any(item['Codigo'] == '1101' for item in payload['sample_products'])
+    assert payload['change_summary']['added_count'] == 2
+    assert payload['change_summary']['updated_count'] == 0
+    assert payload['change_summary']['removed_count'] == 0
+    assert payload['change_summary']['unchanged_count'] == 0
+    assert any(item['change_type'] == 'added' for item in payload['change_summary']['changes'])
+
+    status = client.get('/catalog/erp/status')
+    assert status.status_code == 200
+    assert status.json()['products_loaded'] == 0
+
+    if os.path.exists(target_path):
+        os.remove(target_path)
+    if os.path.isdir(inbox_dir):
+        for entry in os.listdir(inbox_dir):
+            os.remove(os.path.join(inbox_dir, entry))
+        os.rmdir(inbox_dir)
 
 
 def test_catalog_export_csv(monkeypatch):
@@ -335,6 +487,23 @@ def test_catalog_export_csv(monkeypatch):
     assert 'Codigo,Nome,Categoria' in payload
     assert '9911' in payload
     assert 'Produto Exportavel' in payload
+
+
+def test_catalog_export_json_filters_brand(monkeypatch):
+    monkeypatch.setattr(
+        'catalog.onedrive.list_local_products',
+        lambda: [
+            {'Codigo': '9911', 'Nome': 'Produto Nitrolux', 'Categoria': 'LUMINARIA', 'CODMARCA': '1'},
+            {'Codigo': '8822', 'Nome': 'Produto Pienza', 'Categoria': 'LUMINARIA', 'CODMARCA': '2'},
+        ]
+    )
+    client = TestClient(app)
+    rv = client.get('/catalog/export', params={'format': 'json', 'brand': 'pienza'})
+    assert rv.status_code == 200
+    assert 'attachment; filename="catalogo-pienza.json"' == rv.headers.get('content-disposition')
+    payload = rv.json()
+    assert len(payload['products']) == 1
+    assert payload['products'][0]['Codigo'] == '8822'
 
 
 def test_catalog_export_xlsx_single_product(monkeypatch):
@@ -370,6 +539,40 @@ def test_catalog_export_pdf_single_product(monkeypatch):
     assert rv.status_code == 200
     assert rv.headers.get('content-type', '').startswith('application/pdf')
     assert rv.content[:5] == b'%PDF-'
+
+
+def test_catalog_export_technical_sheet_single_product(monkeypatch):
+    monkeypatch.setattr(
+        'catalog.onedrive.list_local_products',
+        lambda: [
+            {
+                'Codigo': '9911',
+                'Nome': 'Luminaria Tecnica',
+                'Categoria': 'LUMINARIA',
+                'Descricao': 'Produto para ficha tecnica',
+                'Especificacoes': 'Potencia: 12W | Tensao: Bivolt | Garantia: 2 anos',
+            }
+        ]
+    )
+    monkeypatch.setattr('catalog.onedrive.find_local_images_for_code', lambda code: [])
+
+    client = TestClient(app)
+    rv = client.get('/catalog/export', params={'format': 'ficha', 'code': '9911'})
+
+    assert rv.status_code == 200
+    assert rv.headers.get('content-type', '').startswith('application/pdf')
+    assert 'attachment; filename="ficha-tecnica-9911.pdf"' == rv.headers.get('content-disposition')
+    assert rv.content[:5] == b'%PDF-'
+
+
+def test_catalog_export_technical_sheet_requires_code(monkeypatch):
+    monkeypatch.setattr('catalog.onedrive.list_local_products', lambda: [{'Codigo': '9911'}])
+
+    client = TestClient(app)
+    rv = client.get('/catalog/export', params={'format': 'ficha'})
+
+    assert rv.status_code == 400
+    assert 'technical sheet export requires a product code' in rv.json()['error']
 
 
 def test_catalog_export_zip_includes_photos(monkeypatch):

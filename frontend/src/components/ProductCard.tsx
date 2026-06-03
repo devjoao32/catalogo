@@ -1,7 +1,8 @@
-import type { CSSProperties } from "react";
+﻿import type { CSSProperties } from "react";
 
 import type { CatalogProduct, ProductPhotos } from "../types";
 import { CARD_FALLBACK_IMAGE, setFallbackImage } from "../lib/catalog-core";
+import { getPrimaryProductImage } from "../lib/catalog-products";
 import { ThumbStrip } from "./Thumb";
 
 interface ProductCardProps {
@@ -9,11 +10,25 @@ interface ProductCardProps {
   photos?: ProductPhotos | null;
   index: number;
   onOpen: () => void;
+  showSalesHighlight?: boolean;
+  salesRank?: number;
 }
 
-export default function ProductCard({ item, photos, index, onOpen }: ProductCardProps): JSX.Element {
-  const previewImage =
-    item.cover || photos?.white_background || photos?.ambient || photos?.measures || CARD_FALLBACK_IMAGE;
+function formatMonthlySales(value: number): string {
+  const maximumFractionDigits = Number.isInteger(value) ? 0 : 1;
+  return new Intl.NumberFormat("pt-BR", { maximumFractionDigits }).format(value);
+}
+
+export default function ProductCard({
+  item,
+  photos,
+  index,
+  onOpen,
+  showSalesHighlight = false,
+  salesRank,
+}: ProductCardProps): JSX.Element {
+  const previewImage = getPrimaryProductImage(photos, item.cover) || CARD_FALLBACK_IMAGE;
+  const shouldShowSales = showSalesHighlight && item.monthlySales > 0;
 
   return (
     <article className="product-card" style={{ "--stagger": `${Math.min(index * 70, 700)}ms` } as CSSProperties}>
@@ -39,6 +54,12 @@ export default function ProductCard({ item, photos, index, onOpen }: ProductCard
         </div>
 
         <div className="card-body">
+          {shouldShowSales && (
+            <div className="card-sales-row">
+              {salesRank ? <span className="card-sales-rank">Top {salesRank}</span> : null}
+              <span className="card-sales-copy">{formatMonthlySales(item.monthlySales)} vendas no mês</span>
+            </div>
+          )}
           <h3>{item.name || "Produto"}</h3>
           <p className="description">{item.description || "Descrição indisponível para este produto."}</p>
           <span className="expand-label">Abrir galeria completa</span>

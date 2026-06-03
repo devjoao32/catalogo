@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 from dotenv import load_dotenv
@@ -44,6 +45,28 @@ def _configure_cors(app: FastAPI, allow_origins: list[str], allow_credentials: b
     )
 
 
+def _configure_sessions(
+    app: FastAPI,
+    secret_key: str,
+    max_age_seconds: int,
+    cookie_secure: bool,
+) -> None:
+    try:
+        from starlette.middleware.sessions import SessionMiddleware
+    except Exception:
+        logger.warning("starlette SessionMiddleware not installed; browser admin login will be unavailable.")
+        return
+
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=secret_key,
+        session_cookie="catalog_admin_session",
+        same_site="lax",
+        https_only=cookie_secure,
+        max_age=max_age_seconds,
+    )
+
+
 def _configure_security_headers(app: FastAPI) -> None:
     @app.middleware("http")
     async def add_security_headers(request: Request, call_next):
@@ -68,7 +91,8 @@ def _register_disabled_docs_routes(app: FastAPI) -> None:
 
 def create_app() -> FastAPI:
     # Carrega o .env antes de importar modulos que dependem do ambiente.
-    load_dotenv()
+    if os.getenv("CATALOG_SKIP_DOTENV", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        load_dotenv()
     configure_logging()
     settings = load_settings()
 
@@ -85,6 +109,12 @@ def create_app() -> FastAPI:
         app,
         allow_origins=settings.cors_allow_origins,
         allow_credentials=settings.cors_allow_credentials,
+    )
+    _configure_sessions(
+        app,
+        secret_key=settings.session_secret,
+        max_age_seconds=settings.session_max_age_seconds,
+        cookie_secure=settings.session_cookie_secure,
     )
     _configure_security_headers(app)
     if not settings.api_docs_enabled:

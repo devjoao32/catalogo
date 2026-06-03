@@ -1,4 +1,4 @@
-import type { ProductPhotos } from "../types";
+﻿import type { ProductPhotos } from "../types";
 import { THUMB_FALLBACK_IMAGE, setFallbackImage } from "../lib/catalog-core";
 
 interface ThumbProps {
@@ -30,8 +30,8 @@ interface ThumbStripProps {
 export function ThumbStrip({ photos }: ThumbStripProps): JSX.Element {
   return (
     <div className="thumb-strip" aria-label="Fotos do produto">
-      <Thumb image={photos?.white_background} label="Fundo branco" />
       <Thumb image={photos?.ambient} label="Ambientada" />
+      <Thumb image={photos?.white_background} label="Fundo branco" />
       <Thumb image={photos?.measures} label="Medidas" />
     </div>
   );

@@ -2,8 +2,37 @@ venv/
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
+!.env.production.example
+frontend/.env.*
+!frontend/.env.production.example
+
+# Sensitive local access registries
+reports/admin_users.json
+reports/representative_users.json
+
+# Local editor/assistant state
+.claude/settings.local.json
+
+# Runtime logs and process output
+*.log
+*.err
+*.out
+*.out.log
+*.err.log
+*.runtime.log
+*.runtime.err
+.codex-*.log
+.codex-*.out.log
+.codex-*.err.log
+
 frontend/node_modules/
 frontend/dist/
+frontend/*.runtime.log
+frontend/*.runtime.err
+frontend/.codex-*.log
+
 edge-profile/
 edge-profile-2/
 .pytest_cache/
@@ -11,12 +40,14 @@ edge-profile-2/
 pytest_tmp*/
 .pytest_tmp_local/
 tmp_pytest_work/
+pytest-cache-files-*/
 server.log
 server.err
 tmp_6410.png
 tmp_6410_wait.png
 reports/_preview_*.pdf
 reports/_debug_*.json
+reports/.pytest*/
 .codex-tmp/
 reports/POSICAO_ESTOQUE.xlsx
 reports/codigos_sem_foto.csv

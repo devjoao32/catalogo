@@ -1,4 +1,4 @@
-import type { CatalogExportFormat } from "../types";
+﻿import type { CatalogExportFormat } from "../types";
 
 interface ExportActionsProps {
   title: string;
@@ -6,6 +6,7 @@ interface ExportActionsProps {
   onExport: (format: CatalogExportFormat) => void;
   disabled?: boolean;
   compact?: boolean;
+  includeTechnicalSheet?: boolean;
 }
 
 const EXPORT_BUTTONS: Array<{ format: CatalogExportFormat; label: string }> = [
@@ -22,7 +23,15 @@ export default function ExportActions({
   onExport,
   disabled = false,
   compact = false,
+  includeTechnicalSheet = false,
 }: ExportActionsProps): JSX.Element {
+  const buttons = includeTechnicalSheet
+    ? [
+        { format: "ficha" as CatalogExportFormat, label: "Ficha técnica" },
+        ...EXPORT_BUTTONS,
+      ]
+    : EXPORT_BUTTONS;
+
   return (
     <section className={`export-panel ${compact ? "is-compact" : ""}`} aria-label={title}>
       <div className="export-copy">
@@ -31,7 +40,7 @@ export default function ExportActions({
       </div>
 
       <div className="export-actions">
-        {EXPORT_BUTTONS.map((item) => (
+        {buttons.map((item) => (
           <button
             key={item.format}
             type="button"

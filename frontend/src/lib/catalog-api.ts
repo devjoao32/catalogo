@@ -1,13 +1,38 @@
-import { API_BASES, REQUEST_TIMEOUT_MS } from "./catalog-core";
+﻿import { API_BASES, REQUEST_TIMEOUT_MS } from "./catalog-core";
 import type {
   CatalogExportOptions,
+  ErpFileRecord,
+  ErpFilePreview,
   ErpImportSummary,
+  ErpProductsResponse,
+  ErpProductSaveSummary,
+  ErpStageFileSummary,
+  ErpStatusResponse,
+  AdminSessionStatus,
+  RepresentativeAuthResponse,
+  RepresentativeAdminDeleteResponse,
+  RepresentativeAdminListResponse,
+  RepresentativeAdminSavePayload,
+  RepresentativeAdminSaveResponse,
+  RepresentativePasswordResetCompleteResponse,
+  RepresentativePasswordResetResponse,
+  RepresentativeSessionStatus,
   ProductImagesResponse,
   ProductPhotos,
   ProductRecord,
 } from "../types";
 
 let activeApiOrigin: string | null = null;
+
+export class ApiRequestError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object";
@@ -45,10 +70,12 @@ function buildCatalogExportUrlForBase(baseOrigin: string, options: CatalogExport
   const query = String(options.query || "").trim();
   const category = String(options.category || "").trim();
   const code = String(options.code || "").trim();
+  const brand = String(options.brand || "").trim();
 
   if (query) url.searchParams.set("query", query);
   if (category) url.searchParams.set("category", category);
   if (code) url.searchParams.set("code", code);
+  if (brand) url.searchParams.set("brand", brand);
 
   return url.toString();
 }
@@ -124,9 +151,9 @@ export async function downloadCatalogExport(options: CatalogExportOptions): Prom
     const targetUrl = buildCatalogExportUrlForBase(resolveBaseOrigin(base), options);
 
     try {
-      const response = await fetchWithTimeout(targetUrl);
+      const response = await fetchWithTimeout(targetUrl, { credentials: "include" });
       if (!response.ok) {
-        lastError = new Error(`Resposta nao-ok para ${targetUrl}: ${response.status}`);
+        lastError = new Error(`Resposta não-ok para ${targetUrl}: ${response.status}`);
         continue;
       }
 
@@ -144,12 +171,12 @@ export async function downloadCatalogExport(options: CatalogExportOptions): Prom
       return;
     } catch (error) {
       lastError = error;
-      console.warn(`Falha ao baixar exportacao em ${targetUrl}. Tentando proxima base.`);
+      console.warn(`Falha ao baixar exportação em ${targetUrl}. Tentando próxima base.`);
     }
   }
 
-  console.error("Todas as bases falharam na exportacao do catalogo.", lastError);
-  throw lastError instanceof Error ? lastError : new Error("Nao foi possivel exportar o catalogo.");
+  console.error("Todas as bases falharam na exportação do catálogo.", lastError);
+  throw lastError instanceof Error ? lastError : new Error("Não foi possível exportar o catálogo.");
 }
 
 export async function downloadImageFile(url: string, filenameBase: string): Promise<void> {
@@ -159,7 +186,7 @@ export async function downloadImageFile(url: string, filenameBase: string): Prom
   try {
     const response = await fetchWithTimeout(targetUrl);
     if (!response.ok) {
-      throw new Error(`Resposta nao-ok para ${targetUrl}: ${response.status}`);
+      throw new Error(`Resposta não-ok para ${targetUrl}: ${response.status}`);
     }
 
     const blob = await response.blob();
@@ -185,16 +212,87 @@ async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Respon
   }
 }
 
-export async function fetchFromBases<T>(buildUrl: (base: string) => string): Promise<T | null> {
+async function parseErrorMessage(response: Response): Promise<string> {
+  const fallback = `Resposta não-ok: ${response.status}`;
+
+  try {
+    const payload = (await response.json()) as unknown;
+    if (!isRecord(payload)) return fallback;
+
+    if (typeof payload.error === "string" && payload.error.trim()) {
+      return payload.error.trim();
+    }
+    if (typeof payload.detail === "string" && payload.detail.trim()) {
+      return payload.detail.trim();
+    }
+    return fallback;
+  } catch {
+    try {
+      const text = await response.text();
+      return text.trim() || fallback;
+    } catch {
+      return fallback;
+    }
+  }
+}
+
+function withAdminHeaders(headers?: HeadersInit, adminToken?: string): Headers {
+  const merged = new Headers(headers || {});
+  const token = String(adminToken || "").trim();
+  if (token) {
+    merged.set("X-Catalog-Admin-Token", token);
+  }
+  return merged;
+}
+
+async function requestJsonFromBases<T>(buildUrl: (base: string) => string, init?: RequestInit): Promise<T> {
   let lastError: unknown = null;
 
   for (const base of API_BASES) {
     const targetUrl = buildUrl(base);
     try {
-      const response = await fetchWithTimeout(targetUrl);
+      const response = await fetchWithTimeout(targetUrl, init);
+      if (!response.ok) {
+        const message = await parseErrorMessage(response);
+        const error = new ApiRequestError(response.status, message);
+        if (response.status !== 404 && response.status < 500) {
+          throw error;
+        }
+        lastError = error;
+        console.warn(`Resposta não-ok para ${targetUrl}: ${response.status} ${message}`);
+        continue;
+      }
+
+      const payload = (await response.json()) as T;
+      activeApiOrigin = resolveBaseOrigin(base);
+      return payload;
+    } catch (error) {
+      if (error instanceof ApiRequestError) {
+        if (error.status !== 404 && error.status < 500) {
+          throw error;
+        }
+      }
+      lastError = error;
+      console.warn(`Falha ao consultar ${targetUrl}. Tentando próxima base.`);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Não foi possível concluir a requisição.");
+}
+
+export async function fetchFromBases<T>(
+  buildUrl: (base: string) => string,
+  init?: RequestInit
+): Promise<T | null> {
+  let lastError: unknown = null;
+
+  for (const base of API_BASES) {
+    const targetUrl = buildUrl(base);
+    try {
+      const response = await fetchWithTimeout(targetUrl, init);
       if (!response.ok) {
         if (response.status !== 404) {
-          console.warn(`Resposta nao-ok para ${targetUrl}: ${response.status}`);
+          console.warn(`Resposta não-ok para ${targetUrl}: ${response.status}`);
         }
         continue;
       }
@@ -203,7 +301,7 @@ export async function fetchFromBases<T>(buildUrl: (base: string) => string): Pro
       return payload;
     } catch (error) {
       lastError = error;
-      console.warn(`Falha ao consultar ${targetUrl}. Tentando proxima base.`);
+      console.warn(`Falha ao consultar ${targetUrl}. Tentando próxima base.`);
     }
   }
 
@@ -231,7 +329,7 @@ export async function postJsonToBases<T>(
       });
       if (!response.ok) {
         const details = await response.text();
-        console.warn(`Resposta nao-ok para ${targetUrl}: ${response.status} ${details}`);
+        console.warn(`Resposta não-ok para ${targetUrl}: ${response.status} ${details}`);
         continue;
       }
       const parsed = (await response.json()) as T;
@@ -239,7 +337,7 @@ export async function postJsonToBases<T>(
       return parsed;
     } catch (error) {
       lastError = error;
-      console.warn(`Falha ao enviar dados para ${targetUrl}. Tentando proxima base.`);
+      console.warn(`Falha ao enviar dados para ${targetUrl}. Tentando próxima base.`);
     }
   }
 
@@ -271,20 +369,28 @@ function normalizePhotos(payload: unknown): ProductPhotos | null {
 }
 
 export async function fetchProducts(): Promise<ProductRecord[]> {
-  const payload = await fetchFromBases<unknown>((base) => `${base}/catalog/local/produtos`);
+  const payload = await fetchFromBases<unknown>((base) => `${base}/catalog/local/produtos`, {
+    credentials: "include",
+  });
   return Array.isArray(payload) ? (payload as ProductRecord[]) : [];
 }
 
 export async function fetchPhotosByCode(code: string): Promise<ProductPhotos | null> {
   const payload = await fetchFromBases<unknown>(
-    (base) => `${base}/catalog/photos?code=${encodeURIComponent(code)}`
+    (base) => `${base}/catalog/photos?code=${encodeURIComponent(code)}`,
+    {
+      credentials: "include",
+    }
   );
   return normalizePhotos(payload);
 }
 
 export async function fetchImagesByCode(code: string): Promise<ProductImagesResponse | null> {
   const payload = await fetchFromBases<unknown>(
-    (base) => `${base}/catalog/produtos/${encodeURIComponent(code)}/imagens`
+    (base) => `${base}/catalog/produtos/${encodeURIComponent(code)}/imagens`,
+    {
+      credentials: "include",
+    }
   );
 
   if (!isRecord(payload)) return null;
@@ -302,4 +408,209 @@ export async function fetchImagesByCode(code: string): Promise<ProductImagesResp
 
 export async function importErpCatalog(payload: unknown): Promise<ErpImportSummary | null> {
   return postJsonToBases<ErpImportSummary>((base) => `${base}/catalog/erp/import`, payload);
+}
+
+export async function fetchErpStatus(adminToken?: string): Promise<ErpStatusResponse> {
+  return requestJsonFromBases<ErpStatusResponse>((base) => `${base}/catalog/erp/status`, {
+    headers: withAdminHeaders(undefined, adminToken),
+    credentials: "include",
+  });
+}
+
+export async function fetchErpFiles(adminToken?: string): Promise<ErpFileRecord[]> {
+  const payload = await requestJsonFromBases<{ files?: ErpFileRecord[] }>(
+    (base) => `${base}/catalog/erp/files`,
+    {
+      headers: withAdminHeaders(undefined, adminToken),
+      credentials: "include",
+    }
+  );
+  return Array.isArray(payload.files) ? payload.files : [];
+}
+
+export async function fetchErpFilePreview(filePath: string, adminToken?: string): Promise<ErpFilePreview> {
+  return requestJsonFromBases<ErpFilePreview>(
+    (base) => `${base}/catalog/erp/files/preview?file_path=${encodeURIComponent(filePath)}`,
+    {
+      headers: withAdminHeaders(undefined, adminToken),
+      credentials: "include",
+    }
+  );
+}
+
+export async function fetchErpProducts(adminToken?: string): Promise<ErpProductsResponse> {
+  return requestJsonFromBases<ErpProductsResponse>((base) => `${base}/catalog/erp/products`, {
+    headers: withAdminHeaders(undefined, adminToken),
+    credentials: "include",
+  });
+}
+
+export async function importErpFileFromPath(filePath: string, adminToken?: string): Promise<ErpImportSummary> {
+  return requestJsonFromBases<ErpImportSummary>((base) => `${base}/catalog/erp/import-file`, {
+    method: "POST",
+    headers: withAdminHeaders({ "Content-Type": "application/json" }, adminToken),
+    credentials: "include",
+    body: JSON.stringify({ file_path: filePath }),
+  });
+}
+
+export async function uploadErpJsonFile(file: File, adminToken?: string): Promise<ErpImportSummary> {
+  const content = await file.arrayBuffer();
+  return requestJsonFromBases<ErpImportSummary>(
+    (base) => `${base}/catalog/erp/upload?filename=${encodeURIComponent(file.name || "erp_upload.json")}`,
+    {
+      method: "POST",
+      headers: withAdminHeaders({ "Content-Type": file.type || "application/json" }, adminToken),
+      credentials: "include",
+      body: content,
+    }
+  );
+}
+
+export async function stageErpJsonFile(file: File, adminToken?: string): Promise<ErpStageFileSummary> {
+  const content = await file.arrayBuffer();
+  return requestJsonFromBases<ErpStageFileSummary>(
+    (base) => `${base}/catalog/erp/stage-file?filename=${encodeURIComponent(file.name || "erp_upload.json")}`,
+    {
+      method: "POST",
+      headers: withAdminHeaders({ "Content-Type": file.type || "application/json" }, adminToken),
+      credentials: "include",
+      body: content,
+    }
+  );
+}
+
+export async function saveErpProduct(
+  code: string,
+  payload: ProductRecord,
+  adminToken?: string
+): Promise<ErpProductSaveSummary> {
+  return requestJsonFromBases<ErpProductSaveSummary>(
+    (base) => `${base}/catalog/erp/products/${encodeURIComponent(code)}`,
+    {
+      method: "PUT",
+      headers: withAdminHeaders({ "Content-Type": "application/json" }, adminToken),
+      credentials: "include",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+export async function fetchAdminSession(): Promise<AdminSessionStatus> {
+  return requestJsonFromBases<AdminSessionStatus>((base) => `${base}/auth/session`, {
+    credentials: "include",
+  });
+}
+
+export async function loginAdminWithPassword(email: string, password: string): Promise<AdminSessionStatus> {
+  return requestJsonFromBases<AdminSessionStatus>((base) => `${base}/auth/admin/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ email, password }),
+  });
+}
+
+export async function logoutAdminSession(): Promise<{ success: boolean; authenticated: boolean }> {
+  return requestJsonFromBases<{ success: boolean; authenticated: boolean }>((base) => `${base}/auth/logout`, {
+    method: "POST",
+    credentials: "include",
+  });
+}
+
+export async function fetchRepresentativeUsers(adminToken?: string): Promise<RepresentativeAdminListResponse> {
+  return requestJsonFromBases<RepresentativeAdminListResponse>((base) => `${base}/catalog/representatives`, {
+    headers: withAdminHeaders(undefined, adminToken),
+    credentials: "include",
+  });
+}
+
+export async function saveRepresentativeUser(
+  payload: RepresentativeAdminSavePayload,
+  adminToken?: string
+): Promise<RepresentativeAdminSaveResponse> {
+  return requestJsonFromBases<RepresentativeAdminSaveResponse>(
+    (base) => `${base}/catalog/representatives/${encodeURIComponent(payload.email)}`,
+    {
+      method: "PUT",
+      headers: withAdminHeaders({ "Content-Type": "application/json" }, adminToken),
+      credentials: "include",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+export async function deleteRepresentativeUser(
+  email: string,
+  adminToken?: string
+): Promise<RepresentativeAdminDeleteResponse> {
+  return requestJsonFromBases<RepresentativeAdminDeleteResponse>(
+    (base) => `${base}/catalog/representatives/${encodeURIComponent(email)}`,
+    {
+      method: "DELETE",
+      headers: withAdminHeaders(undefined, adminToken),
+      credentials: "include",
+    }
+  );
+}
+
+export async function createRepresentativePasswordReset(
+  email: string,
+  adminToken?: string
+): Promise<RepresentativePasswordResetResponse> {
+  return requestJsonFromBases<RepresentativePasswordResetResponse>(
+    (base) => `${base}/catalog/representatives/${encodeURIComponent(email)}/password-reset`,
+    {
+      method: "POST",
+      headers: withAdminHeaders(undefined, adminToken),
+      credentials: "include",
+    }
+  );
+}
+
+export async function fetchRepresentativeSession(): Promise<RepresentativeSessionStatus> {
+  return requestJsonFromBases<RepresentativeSessionStatus>((base) => `${base}/auth/representative/session`, {
+    credentials: "include",
+  });
+}
+
+export async function loginRepresentative(
+  email: string,
+  password: string
+): Promise<RepresentativeAuthResponse> {
+  return requestJsonFromBases<RepresentativeAuthResponse>(
+    (base) => `${base}/auth/representative/login`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ email, password }),
+    }
+  );
+}
+
+export async function resetRepresentativePassword(
+  email: string,
+  resetCode: string,
+  newPassword: string
+): Promise<RepresentativePasswordResetCompleteResponse> {
+  return requestJsonFromBases<RepresentativePasswordResetCompleteResponse>(
+    (base) => `${base}/auth/representative/reset-password`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ email, reset_code: resetCode, new_password: newPassword }),
+    }
+  );
+}
+
+export async function logoutRepresentative(): Promise<{ success: boolean; authenticated: boolean }> {
+  return requestJsonFromBases<{ success: boolean; authenticated: boolean }>(
+    (base) => `${base}/auth/representative/logout`,
+    {
+      method: "POST",
+      credentials: "include",
+    }
+  );
 }

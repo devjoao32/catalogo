@@ -1,5 +1,6 @@
 import os
 import pytest
+from catalog.technical_specs import clear_technical_specs_cache
 from catalog.onedrive import (
     _encode_share_url,
     categorize_photos,
@@ -98,19 +99,13 @@ def test_auth_endpoints(monkeypatch):
 
     # Importa app apos patch para registrar rotas normalmente.
     from app import app
-
-    # Alem do roteamento, valida tambem a logica do handler.
-    from catalog.auth import STATE_COOKIE_NAME, login
-    from fastapi.responses import RedirectResponse
-
-    resp = login()
-    assert isinstance(resp, RedirectResponse)
-    assert resp.headers.get('location', '').startswith('https://login.microsoftonline.com')
-    assert STATE_COOKIE_NAME in resp.headers.get("set-cookie", "")
+    from catalog.auth import STATE_COOKIE_NAME
 
     client = TestClient(app)
-    resp3 = client.get('/auth/login', follow_redirects=False)
+    resp3 = client.get('/auth/login', params={'next': '/erp'}, follow_redirects=False)
     assert resp3.status_code in {302, 307}
+    assert resp3.headers.get('location', '').startswith('https://login.microsoftonline.com')
+    assert STATE_COOKIE_NAME in resp3.headers.get("set-cookie", "")
 
     state = client.cookies.get(STATE_COOKIE_NAME)
     assert state
@@ -121,9 +116,14 @@ def test_auth_endpoints(monkeypatch):
     resp5 = client.get('/auth/callback', params={'code': 'abc123', 'state': 'invalid-state'})
     assert resp5.status_code == 400
 
-    resp6 = client.get('/auth/callback', params={'code': 'abc123', 'state': state})
-    assert resp6.status_code == 200
-    assert resp6.json() == {"success": True}
+    resp6 = client.get('/auth/callback', params={'code': 'abc123', 'state': state}, follow_redirects=False)
+    assert resp6.status_code == 303
+    assert resp6.headers.get('location') == '/erp'
+
+    session = client.get('/auth/session')
+    assert session.status_code == 200
+    assert session.json()['authenticated'] is True
+    assert session.json()['provider'] == 'azure'
 
 
 def test_auth_callback_sanitizes_token_exchange_failure(monkeypatch):
@@ -167,6 +167,7 @@ def test_local_products_and_local_photos(tmp_path):
     assert first["Codigo"] == "5989"
     assert first["Categoria"] == "ABAJUR"
     assert first["URLFoto"].startswith("/catalog/local/asset?path=")
+    assert "foto_ambient.jpg" in first["URLFoto"]
 
     photos = categorize_local_photos("5989", str(root))
     assert photos["white_background"].startswith("/catalog/local/asset?path=")
@@ -228,6 +229,55 @@ def test_local_products_fallbacks_to_stock_report(monkeypatch, tmp_path):
     monkeypatch.delenv("CATALOG_LOCAL_PRODUCTS_PATH", raising=False)
     monkeypatch.delenv("OneDrive", raising=False)
     monkeypatch.delenv("OneDriveCommercial", raising=False)
+    monkeypatch.delenv("OneDriveConsumer", raising=False)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "user"))
+
+    products = list_local_products()
+
+    assert [item["Codigo"] for item in products] == ["1181", "2002", "2002"]
+    assert products[0]["Nome"] == "FITA LED 2835 3000K 12V 5M"
+    assert products[0]["Categoria"] == "FITA LED"
+    assert products[1]["Nome"] == "LUMINARIA SPOT LS-001"
+    assert products[1]["Categoria"] == "LUMINARIA"
+    assert products[2]["Nome"] == "LUMINARIA DUPLICADA"
+    assert products[0]["URLFoto"].startswith("/catalog/local/asset?path=")
+    assert products[0]["FotoBranco"].startswith("/catalog/local/asset?path=")
+
+
+def test_local_products_fill_specs_from_technical_specs_file(monkeypatch, tmp_path):
+    root = tmp_path / "01_PRODUTOS"
+    product_dir = root / "LAMPADAS" / "1580 - LAMP LED TESTE"
+    product_dir.mkdir(parents=True)
+    (product_dir / "1580_1.jpg").write_bytes(b"white")
+
+    specs_file = tmp_path / "technical_specs_ascii.txt"
+    specs_file.write_text(
+        "CODIGO: 1580\\REFERENCIA: 1580\\POTENCIA(W): 7W\\BASE: E27\\GARANTIA: 2 anos",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("CATALOG_TECHNICAL_SPECS_PATH", str(specs_file))
+    clear_technical_specs_cache()
+
+    products = list_local_products(str(root))
+    assert len(products) == 1
+    assert products[0]["Codigo"] == "1580"
+    assert products[0]["Especificacoes"] == "CODIGO: 1580 | REFERENCIA: 1580 | POTENCIA(W): 7W | BASE: E27 | GARANTIA: 2 anos"
+    return
+
+    specs_file = tmp_path / "technical_specs.txt"
+    specs_file.write_text(
+        "CÓDIGO: 1580\\REFERÊNCIA: 1580\\POTÊNCIA(W): 7W\\BASE: E27\\GARANTIA: 2 anos",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("CATALOG_TECHNICAL_SPECS_PATH", str(specs_file))
+    clear_technical_specs_cache()
+
+    products = list_local_products(str(root))
+    assert len(products) == 1
+    assert products[0]["Codigo"] == "1580"
+    assert products[0]["Especificacoes"] == "CÓDIGO: 1580 | REFERÊNCIA: 1580 | POTÊNCIA(W): 7W | BASE: E27 | GARANTIA: 2 anos"
     monkeypatch.delenv("OneDriveConsumer", raising=False)
     monkeypatch.setenv("USERPROFILE", str(tmp_path / "user"))
 
@@ -406,12 +456,14 @@ def test_local_index_ignores_empty_explicit_root(monkeypatch, tmp_path):
     assert products[0]["Codigo"] == "5989"
 
 
-def test_resolve_local_root_prefers_fotos_produtos(monkeypatch, tmp_path):
+def test_resolve_local_root_prefers_ti1_catalogo(monkeypatch, tmp_path):
     one_drive_root = tmp_path / "OneDrive"
+    premium_root = one_drive_root / "TI 1" / "catalogo"
     fotos_root = one_drive_root / "FOTOS_PRODUTOS"
     backup_root = one_drive_root / "MARKETING" / "01_PRODUTOS" / "BACKUP PRODUTOS"
     catalog_root = one_drive_root / "MARKETING" / "Catalogo"
     legacy_root = one_drive_root / "MARKETING" / "01_PRODUTOS"
+    premium_root.mkdir(parents=True)
     fotos_root.mkdir(parents=True)
     backup_root.mkdir(parents=True)
     catalog_root.mkdir(parents=True)
@@ -421,7 +473,7 @@ def test_resolve_local_root_prefers_fotos_produtos(monkeypatch, tmp_path):
     monkeypatch.setenv("OneDrive", str(one_drive_root))
 
     resolved = resolve_local_products_root()
-    assert resolved == os.path.abspath(str(fotos_root))
+    assert resolved == os.path.abspath(str(premium_root))
 
 
 def test_flat_backup_layout_groups_code_and_derives_category(tmp_path):
@@ -456,10 +508,28 @@ def test_flat_layout_supports_underscore_sequences(tmp_path):
     products = list_local_products(str(root))
     assert len(products) == 1
     assert products[0]["Codigo"] == "1171"
+    assert products[0]["URLFoto"].endswith("1171_3.jpg")
 
     images = find_local_images_for_code("1171", str(root))
     names = [img["name"] for img in images]
     assert names == ["1171_1.jpg", "1171_2.jpg", "1171_3.jpg"]
+
+    photos = categorize_local_photos("1171", str(root))
+    assert photos["white_background"].endswith("1171_1.jpg")
+    assert photos["measures"].endswith("1171_2.jpg")
+    assert photos["ambient"].endswith("1171_3.jpg")
+
+
+def test_underscore_sequences_keep_measures_without_ambient_fallback(tmp_path):
+    root = tmp_path / "catalogo"
+    root.mkdir(parents=True)
+    (root / "1393_1.jpg").write_bytes(b"1")
+    (root / "1393_2.jpg").write_bytes(b"2")
+
+    photos = categorize_local_photos("1393", str(root))
+    assert photos["white_background"].endswith("1393_1.jpg")
+    assert photos["measures"].endswith("1393_2.jpg")
+    assert photos["ambient"] is None
 
 
 def test_category_variants_are_grouped_under_same_bucket(tmp_path):
@@ -600,4 +670,107 @@ def test_shortcut_target_image_is_used(monkeypatch, tmp_path):
     images = find_local_images_for_code("6001")
     assert len(images) == 1
     assert images[0]["name"] == "6001 - ABAJUR DROP-001B E27X1"
+
+
+def test_local_products_merge_monthly_sales_from_stock_report(monkeypatch, tmp_path):
+    from openpyxl import Workbook
+
+    root = tmp_path / "Catalogo"
+    category = root / "ABAJUR"
+    category.mkdir(parents=True)
+    (category / "1424 - BOCAL DE LOUCA M519 BIVOLT E27.jpg").write_bytes(b"img")
+
+    report_path = tmp_path / "POSICAO_ESTOQUE.xlsx"
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "POSICAO_ESTOQUE"
+    worksheet.append(
+        [
+            "FILIAL",
+            "CODIGO",
+            "DESCRICAO",
+            "EMB",
+            "UNI.",
+            "CLASSE",
+            "OBS2",
+            "FISICO",
+            "BLOQ.",
+            "RESERV.",
+            "DISP.",
+            "ESTOQUE",
+            "VL. ULT.ENT",
+            "VENDA MES",
+            "VENDA MES 1",
+            "VENDA MES 2",
+            "VENDA MES 3",
+            "COD. BARRAS",
+            "COD. FABRICA",
+            "COD. MASTER",
+            "COD. PRINCIPAL",
+        ]
+    )
+    worksheet.append(
+        [
+            2,
+            1424,
+            "BOCAL DE LOUCA M519 BIVOLT E27",
+            "UND",
+            "UN",
+            "C",
+            "N",
+            3669,
+            0,
+            0,
+            3669,
+            3669,
+            0.351,
+            600,
+            50,
+            0,
+            0,
+            7896688171513,
+            "",
+            1424,
+            1424,
+        ]
+    )
+    worksheet.append(
+        [
+            3,
+            1424,
+            "BOCAL DE LOUCA M519 BIVOLT E27",
+            "UND",
+            "UN",
+            "C",
+            "N",
+            120,
+            0,
+            0,
+            120,
+            120,
+            0.351,
+            40,
+            5,
+            0,
+            0,
+            7896688171513,
+            "",
+            1424,
+            1424,
+        ]
+    )
+    workbook.save(report_path)
+    workbook.close()
+
+    monkeypatch.setenv("CATALOG_STOCK_REPORT_PATH", str(report_path))
+    monkeypatch.setenv("CATALOG_STOCK_REPORT_AUTO_DISCOVERY", "0")
+    monkeypatch.setenv("CATALOG_ERP_JSON_PATH", str(tmp_path / "missing_erp.json"))
+
+    products = list_local_products(str(root))
+    by_code = {item["Codigo"]: item for item in products}
+
+    assert by_code["1424"]["VendaMes"] == 640
+    assert by_code["1424"]["VendaMes1"] == 55
+    assert by_code["1424"]["VendaMes2"] == 0
+    assert by_code["1424"]["VendaMes3"] == 0
 

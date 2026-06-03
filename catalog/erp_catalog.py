@@ -11,11 +11,14 @@ import unicodedata
 from urllib.parse import quote
 from typing import Any, Dict, List
 
+from .technical_specs import resolve_technical_specs
+
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_ERP_JSON_PATH = BASE_DIR / "reports" / "erp_products.json"
 DEFAULT_ERP_INBOX_DIR = BASE_DIR / "reports" / "erp_inbox"
 DEFAULT_ERP_DROP_DIR = BASE_DIR / "catalog" / "json"
+CATALOG_META_KEY = "catalog_meta"
 PRODUCT_CONTAINER_KEYS = (
     "produtos",
     "products",
@@ -35,6 +38,20 @@ DISCOVERY_PATTERNS = (
     "*catalog*.json",
 )
 JSON_TEXT_ENCODINGS = ("utf-8-sig", "utf-16", "latin-1")
+PREVIEW_SAMPLE_SIZE = 8
+PREVIEW_CHANGE_SAMPLE_SIZE = 8
+CHANGE_FIELD_LABELS = {
+    "nome": "Nome",
+    "categoria": "Categoria",
+    "descricao": "Descricao",
+    "especificacoes": "Especificacoes",
+    "urlfoto": "Foto principal",
+    "fotobranco": "Foto branco",
+    "fotoambient": "Foto ambientada",
+    "fotomedidas": "Foto medidas",
+    "codepto": "CODEPTO",
+    "codsec": "CODSEC",
+}
 
 CODE_ALIASES = (
     "Codigo",
@@ -266,26 +283,50 @@ def _token_to_category(token: str, next_token: str = "") -> str | None:
         return "TRILHO"
     if token_upper.startswith("PERFIL"):
         return "PERFIL"
+    if token_upper.startswith("SPOT"):
+        return "SPOT"
     if token_upper.startswith("SENSOR"):
         return "SENSOR"
+    if token_upper.startswith("RELE") or token_upper.startswith("FOTOCEL"):
+        return "RELE"
     if token_upper.startswith("BOCAL"):
         return "BOCAL"
+    if token_upper.startswith("RABICHO"):
+        return "RABICHO"
+    if token_upper.startswith("BASE"):
+        return "BASE"
+    if token_upper.startswith("CONECT") or token_upper.startswith("CONEX"):
+        return "CONECTOR"
+    if token_upper.startswith("EMENDA"):
+        return "EMENDA"
+    if token_upper.startswith("ADAPTADOR"):
+        return "ADAPTADOR"
     if token_upper.startswith("ESPETO"):
         return "ESPETO"
     if token_upper.startswith("BALIZADOR"):
         return "BALIZADOR"
+    if token_upper.startswith("TARTARUGA"):
+        return "TARTARUGA"
     if token_upper.startswith("ESPELHO"):
         return "ESPELHO"
+    if token_upper.startswith("PISCA") or token_upper.startswith("CORTINA"):
+        return "PISCA LED"
     if token_upper.startswith("REFLET") or token_upper.startswith("HOLOFOTE"):
         return "REFLETOR"
     if token_upper.startswith("LAMP"):
         return "LAMPADA"
     if token_upper.startswith("DRIVER") or token_upper.startswith("FONTE"):
         return "DRIVER/FONTE"
-    if token_upper == "FITA":
+    if token_upper == "FITA" or token_upper.startswith("MANG"):
         return "FITA LED"
     if token_upper.startswith("LUMINARIA") or token_upper in {"LUMI", "LUM", "LUMIN"}:
         return "LUMINARIA"
+    if token_upper.startswith("CADEIRA"):
+        return "CADEIRA"
+    if token_upper.startswith("RODA") or token_upper.startswith("RODIZ"):
+        return "RODA E RODIZIO"
+    if token_upper.startswith("PALETEIR") or token_upper.startswith("TRANSPALETE"):
+        return "PALETEIRA"
     return None
 
 
@@ -340,21 +381,73 @@ def _infer_category(
 
 
 def _to_business_category(category: str, name: str = "", description: str = "") -> str:
-    normalized = _normalize_text(category).strip()
-    name_desc_tokens = set(_normalized_tokens(f"{name} {description}"))
+    def _clean_category_label(value: str) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip()).upper()
 
-    # Prioriza termos explicitos do nome/descricao para evitar itens "fora" da categoria esperada.
-    for mapped_category, keywords in NAME_KEYWORD_PRIORITY:
-        if any(token in name_desc_tokens for token in keywords):
-            return mapped_category
+    def _is_generic_category(value: str) -> bool:
+        normalized_value = _normalize_text(value).strip()
+        if not normalized_value:
+            return True
+        if normalized_value == "sem categoria":
+            return True
+        if normalized_value in BUSINESS_CATEGORY_MAP:
+            return True
+        if normalized_value in {_normalize_text(item) for item in DEPT_CATEGORY_MAP.values()}:
+            return True
+        if normalized_value in {_normalize_text(item) for item in DEPT_SECTION_CATEGORY_MAP.values()}:
+            return True
+        return normalized_value.startswith("depto ") or normalized_value.startswith("sec ")
 
-    if normalized in BUSINESS_CATEGORY_MAP and normalized != "sem categoria":
-        return BUSINESS_CATEGORY_MAP[normalized]
+    def _specific_category_from_tokens(tokens: List[str]) -> str | None:
+        if not tokens:
+            return None
 
-    tokens = set(_normalized_tokens(f"{category} {name} {description}"))
-    for mapped_category, keywords in NAME_KEYWORD_PRIORITY:
-        if any(token in tokens for token in keywords):
-            return mapped_category
+        token_set = set(tokens)
+        if ("iluminacao" in token_set and "publica" in token_set) or (
+            ("publica" in token_set or "pub" in token_set)
+            and any(token in token_set for token in {"luminaria", "lum", "lumi", "lumin", "poste", "fotocel", "fotocelula"})
+        ):
+            return "ILUMINACAO PUBLICA"
+
+        if "filamento" in token_set:
+            return "LAMPADA FILAMENTO"
+
+        luminaria_candidate: str | None = None
+        for idx, token in enumerate(tokens):
+            mapped = _token_to_category(token, tokens[idx + 1] if idx + 1 < len(tokens) else "")
+            if not mapped:
+                continue
+            if mapped == "LUMINARIA":
+                luminaria_candidate = mapped
+                continue
+            return mapped
+
+        return luminaria_candidate
+
+    for candidate in (name, description, category):
+        mapped = _specific_category_from_tokens(_normalized_tokens(candidate))
+        if mapped:
+            return mapped
+
+    normalized_category = _normalize_text(category).strip()
+    cleaned_category = _clean_category_label(category)
+    if _is_generic_category(category):
+        if (
+            normalized_category in {"", "sem categoria"}
+            or normalized_category.startswith("depto ")
+            or normalized_category.startswith("sec ")
+        ):
+            return "OUTROS ITENS ERP"
+        return cleaned_category or "OUTROS ITENS ERP"
+
+    if (
+        cleaned_category
+        and not _is_numeric_text(cleaned_category)
+        and not normalized_category.startswith("grupo ")
+        and not normalized_category.startswith("depto ")
+        and not normalized_category.startswith("sec ")
+    ):
+        return cleaned_category
 
     return "OUTROS ITENS ERP"
 
@@ -379,6 +472,65 @@ def _stringify(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return str(value).strip()
+
+
+def _preferred_cover_url(ambient_url: Any, white_url: Any, measures_url: Any, cover_url: Any) -> str:
+    for candidate in (ambient_url, white_url, measures_url, cover_url):
+        rendered = _stringify(candidate)
+        if rendered:
+            return rendered
+    return ""
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _extract_catalog_meta(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    raw_meta = payload.get(CATALOG_META_KEY)
+    meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+
+    for key in ("imported_at", "updated_at", "source_path", "source_name", "source_updated_at"):
+        value = payload.get(key)
+        if key not in meta and isinstance(value, str) and value.strip():
+            meta[key] = value.strip()
+
+    if "source_size_bytes" not in meta:
+        parsed_size = _safe_int(payload.get("source_size_bytes"))
+        if parsed_size is not None:
+            meta["source_size_bytes"] = parsed_size
+
+    parsed_meta_size = _safe_int(meta.get("source_size_bytes"))
+    if parsed_meta_size is not None:
+        meta["source_size_bytes"] = parsed_meta_size
+    elif "source_size_bytes" in meta:
+        meta.pop("source_size_bytes", None)
+
+    return meta
+
+
+def _build_source_metadata(path: Path) -> Dict[str, Any]:
+    stat = path.stat()
+    return {
+        "source_path": str(path),
+        "source_name": path.name,
+        "source_size_bytes": stat.st_size,
+        "source_updated_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+    }
+
+
+def _resolve_deployed_source_path(meta: Dict[str, Any]) -> Path | None:
+    source_path = str(meta.get("source_path") or "").strip()
+    if not source_path:
+        return None
+    return Path(source_path)
 
 
 def resolve_erp_inbox_dir() -> Path:
@@ -534,12 +686,20 @@ def _normalize_erp_record(record: Dict[str, Any]) -> Dict[str, Any] | None:
         dept_code=dept_code,
         sec_code=sec_code,
     )
-    specs = _stringify(_pick_value(lookup, SPECS_ALIASES))
+    specs = resolve_technical_specs(
+        code=code,
+        current_specs=_pick_value(lookup, SPECS_ALIASES),
+        name=name,
+        description=description,
+        category=category,
+        extra_fields=record,
+    )
 
     cover_url = _stringify(_pick_value(lookup, COVER_IMAGE_ALIASES))
     white_url = _stringify(_pick_value(lookup, WHITE_IMAGE_ALIASES)) or cover_url
     ambient_url = _stringify(_pick_value(lookup, AMBIENT_IMAGE_ALIASES))
     measures_url = _stringify(_pick_value(lookup, MEASURES_IMAGE_ALIASES))
+    preferred_cover = _preferred_cover_url(ambient_url, white_url, measures_url, cover_url)
 
     normalized: Dict[str, Any] = {
         "Codigo": code,
@@ -547,8 +707,8 @@ def _normalize_erp_record(record: Dict[str, Any]) -> Dict[str, Any] | None:
         "Descricao": description,
         "Categoria": category,
         "Especificacoes": specs,
-        "URLFoto": cover_url or white_url,
-        "FotoBranco": white_url or cover_url,
+        "URLFoto": preferred_cover,
+        "FotoBranco": white_url or preferred_cover,
         "FotoAmbient": ambient_url,
         "FotoMedidas": measures_url,
     }
@@ -573,6 +733,178 @@ def _build_index(payload: Any) -> Dict[str, Dict[str, Any]]:
             continue
         index[str(normalized["Codigo"])] = normalized
     return index
+
+
+def _change_field_label(key: str) -> str:
+    return CHANGE_FIELD_LABELS.get(_normalize_key(key), key)
+
+
+def _product_sort_key(product: Dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        _normalize_text(_stringify(product.get("Categoria"))),
+        _normalize_text(_stringify(product.get("Nome"))),
+        _stringify(product.get("Codigo")),
+    )
+
+
+def _detect_changed_fields(
+    next_product: Dict[str, Any],
+    current_product: Dict[str, Any],
+) -> List[str]:
+    changed_fields: List[str] = []
+    seen_labels: set[str] = set()
+    all_keys = list(next_product.keys()) + [key for key in current_product.keys() if key not in next_product]
+
+    for key in all_keys:
+        if _stringify(next_product.get(key)) == _stringify(current_product.get(key)):
+            continue
+        label = _change_field_label(key)
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        changed_fields.append(label)
+
+    return changed_fields
+
+
+def _build_change_summary(
+    next_index: Dict[str, Dict[str, Any]],
+    current_index: Dict[str, Dict[str, Any]],
+    *,
+    compared_to_path: str = "",
+    compared_to_name: str = "",
+) -> Dict[str, Any]:
+    added_changes: List[Dict[str, Any]] = []
+    updated_changes: List[Dict[str, Any]] = []
+    removed_changes: List[Dict[str, Any]] = []
+    unchanged_count = 0
+
+    for code, product in sorted(next_index.items(), key=lambda item: _product_sort_key(item[1])):
+        current_product = current_index.get(code)
+        name = _stringify(product.get("Nome")) or f"Produto {code}"
+        category = _stringify(product.get("Categoria")) or "Sem categoria"
+
+        if current_product is None:
+            added_changes.append(
+                {
+                    "change_type": "added",
+                    "code": code,
+                    "name": name,
+                    "category": category,
+                    "previous_name": None,
+                    "previous_category": None,
+                    "changed_fields": [],
+                }
+            )
+            continue
+
+        changed_fields = _detect_changed_fields(product, current_product)
+        if not changed_fields:
+            unchanged_count += 1
+            continue
+
+        updated_changes.append(
+            {
+                "change_type": "updated",
+                "code": code,
+                "name": name,
+                "category": category,
+                "previous_name": _stringify(current_product.get("Nome")) or None,
+                "previous_category": _stringify(current_product.get("Categoria")) or None,
+                "changed_fields": changed_fields,
+            }
+        )
+
+    for code, product in sorted(
+        ((code, product) for code, product in current_index.items() if code not in next_index),
+        key=lambda item: _product_sort_key(item[1]),
+    ):
+        removed_changes.append(
+            {
+                "change_type": "removed",
+                "code": code,
+                "name": _stringify(product.get("Nome")) or f"Produto {code}",
+                "category": _stringify(product.get("Categoria")) or "Sem categoria",
+                "previous_name": None,
+                "previous_category": None,
+                "changed_fields": [],
+            }
+        )
+
+    sampled_changes = (updated_changes + added_changes + removed_changes)[:PREVIEW_CHANGE_SAMPLE_SIZE]
+
+    return {
+        "compared_to_path": compared_to_path or None,
+        "compared_to_name": compared_to_name or None,
+        "added_count": len(added_changes),
+        "updated_count": len(updated_changes),
+        "removed_count": len(removed_changes),
+        "unchanged_count": unchanged_count,
+        "changes": sampled_changes,
+    }
+
+
+def _build_preview_summary(
+    payload: Any,
+    *,
+    source_path: str = "",
+    source_name: str = "",
+    source_size_bytes: int | None = None,
+    source_updated_at: str | None = None,
+    is_active: bool = False,
+    is_deployed_source: bool = False,
+    current_index: Dict[str, Dict[str, Any]] | None = None,
+    compared_to_path: str = "",
+    compared_to_name: str = "",
+) -> Dict[str, Any]:
+    records = _extract_records(payload)
+    index = _build_index(payload)
+    products = sort_products_by_category(list(index.values()))
+    category_counts: Dict[str, int] = {}
+    sample_products: List[Dict[str, str]] = []
+
+    for product in products:
+        category = _stringify(product.get("Categoria")) or "Sem categoria"
+        category_counts[category] = category_counts.get(category, 0) + 1
+
+        if len(sample_products) < PREVIEW_SAMPLE_SIZE:
+            sample_products.append(
+                {
+                    "Codigo": _stringify(product.get("Codigo")),
+                    "Nome": _stringify(product.get("Nome")) or f"Produto {_stringify(product.get('Codigo'))}",
+                    "Categoria": category,
+                }
+            )
+
+    categories = [
+        {"name": name, "count": count}
+        for name, count in sorted(category_counts.items(), key=lambda item: (-item[1], _normalize_text(item[0])))
+    ]
+
+    meta = _extract_catalog_meta(payload)
+    resolved_name = source_name or (Path(source_path).name if source_path else "")
+
+    return {
+        "path": source_path,
+        "name": resolved_name,
+        "size_bytes": source_size_bytes or 0,
+        "updated_at": source_updated_at or None,
+        "is_active": is_active,
+        "is_deployed_source": is_deployed_source,
+        "products_loaded": len(products),
+        "records_detected": len(records),
+        "ignored_records": max(len(records) - len(products), 0),
+        "imported_at": _stringify(meta.get("imported_at")) or None,
+        "payload_updated_at": _stringify(meta.get("updated_at")) or None,
+        "categories": categories,
+        "sample_products": sample_products,
+        "change_summary": _build_change_summary(
+            index,
+            current_index or {},
+            compared_to_path=compared_to_path,
+            compared_to_name=compared_to_name,
+        ),
+    }
 
 
 def _parse_json_bytes(content: bytes) -> Any:
@@ -644,44 +976,35 @@ def _resolve_candidate_file_path(file_path: str) -> Path:
     raise ValueError("ERP file not found")
 
 
-def import_erp_payload(payload: Any) -> Dict[str, Any]:
+def import_erp_payload(payload: Any, deployment_source: Dict[str, Any] | None = None) -> Dict[str, Any]:
     index = _build_index(payload)
     if not index:
         raise ValueError("no valid product records with code found in ERP payload")
 
     imported_at = datetime.now(timezone.utc).isoformat()
-    stored_payload = {
-        "imported_at": imported_at,
-        "products": list(index.values()),
-    }
-
-    target = _resolve_json_target_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(stored_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    base_payload = _load_existing_erp_payload() if _resolve_json_target_path().is_file() else {}
+    return _write_erp_products(
+        list(index.values()),
+        base_payload=base_payload,
+        imported_at=imported_at,
+        deployment_source=deployment_source,
+        persist_change_summary=True,
     )
-
-    return {
-        "path": str(target),
-        "products_imported": len(index),
-        "imported_at": imported_at,
-    }
 
 
 def import_erp_file(file_path: str) -> Dict[str, Any]:
     source = _resolve_candidate_file_path(file_path)
     payload = _load_json_file(source)
-    result = import_erp_payload(payload)
-    result["source_path"] = str(source)
-    result["source_size_bytes"] = source.stat().st_size
+    source_metadata = _build_source_metadata(source)
+    result = import_erp_payload(payload, deployment_source=source_metadata)
+    result.update(source_metadata)
     return result
 
 
-def receive_erp_file(filename: str, content: bytes) -> Dict[str, Any]:
+def _store_uploaded_file(filename: str, content: bytes) -> Dict[str, Any]:
     if len(content) > get_max_upload_size_bytes():
         raise ValueError("ERP upload too large")
-    payload = _parse_json_bytes(content)
+    _parse_json_bytes(content)
     safe_filename = _sanitize_json_filename(filename)
     inbox_dir = resolve_erp_inbox_dir()
     inbox_dir.mkdir(parents=True, exist_ok=True)
@@ -692,16 +1015,67 @@ def receive_erp_file(filename: str, content: bytes) -> Dict[str, Any]:
         target = inbox_dir / f"{target.stem}_{stamp}{target.suffix}"
 
     target.write_bytes(content)
+    stored = _build_source_metadata(target)
+    return {
+        "path": str(target),
+        "name": target.name,
+        "size_bytes": stored["source_size_bytes"],
+        "updated_at": stored["source_updated_at"],
+    }
 
-    result = import_erp_payload(payload)
-    result["uploaded_path"] = str(target)
-    result["uploaded_size_bytes"] = target.stat().st_size
+
+def stage_erp_file(filename: str, content: bytes) -> Dict[str, Any]:
+    stored = _store_uploaded_file(filename, content)
+    preview = preview_erp_file(stored["path"])
+    preview["staged"] = True
+    return preview
+
+
+def receive_erp_file(filename: str, content: bytes) -> Dict[str, Any]:
+    stored = _store_uploaded_file(filename, content)
+    result = import_erp_file(stored["path"])
+    result["uploaded_path"] = stored["path"]
+    result["uploaded_size_bytes"] = stored["size_bytes"]
+    result["uploaded_updated_at"] = stored["updated_at"]
     return result
+
+
+def preview_erp_file(file_path: str) -> Dict[str, Any]:
+    source = _resolve_candidate_file_path(file_path)
+    payload = _load_json_file(source)
+    active_path = _resolve_json_path()
+    active = active_path.resolve(strict=False)
+    active_payload = _load_existing_erp_payload()
+    active_meta = _extract_catalog_meta(active_payload)
+    deployed_source = _resolve_deployed_source_path(_extract_catalog_meta(_load_existing_erp_payload()))
+    resolved_source = source.resolve(strict=False)
+    source_stat = source.stat()
+    compared_to_path = _stringify(active_meta.get("source_path"))
+    compared_to_name = _stringify(active_meta.get("source_name"))
+
+    if not compared_to_path and active_path.is_file():
+        compared_to_path = str(active_path)
+    if not compared_to_name and active_path.is_file():
+        compared_to_name = active_path.name
+
+    return _build_preview_summary(
+        payload,
+        source_path=str(source),
+        source_name=source.name,
+        source_size_bytes=source_stat.st_size,
+        source_updated_at=datetime.fromtimestamp(source_stat.st_mtime, tz=timezone.utc).isoformat(),
+        is_active=resolved_source == active,
+        is_deployed_source=bool(deployed_source and resolved_source == deployed_source.resolve(strict=False)),
+        current_index=load_erp_index(),
+        compared_to_path=compared_to_path,
+        compared_to_name=compared_to_name,
+    )
 
 
 def list_erp_files() -> List[Dict[str, Any]]:
     active_path = _resolve_json_path()
     active = active_path.resolve(strict=False)
+    deployed_source = _resolve_deployed_source_path(_extract_catalog_meta(_load_existing_erp_payload()))
     seen: dict[Path, Path] = {}
 
     for root in _resolve_erp_source_dirs():
@@ -715,6 +1089,8 @@ def list_erp_files() -> List[Dict[str, Any]]:
 
     if active_path.is_file():
         seen[active] = active_path
+    if deployed_source and deployed_source.is_file():
+        seen[deployed_source.resolve(strict=False)] = deployed_source
 
     files: List[Dict[str, Any]] = []
     for resolved, item in seen.items():
@@ -726,11 +1102,146 @@ def list_erp_files() -> List[Dict[str, Any]]:
                 "size_bytes": stat.st_size,
                 "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
                 "is_active": resolved == active,
+                "is_deployed_source": bool(
+                    deployed_source and resolved == deployed_source.resolve(strict=False)
+                ),
             }
         )
 
     files.sort(key=lambda entry: entry["updated_at"], reverse=True)
     return files
+
+
+def _load_existing_erp_payload() -> Dict[str, Any]:
+    source = _resolve_json_path()
+    if not source.is_file():
+        return {}
+
+    payload = _load_json_file(source)
+    if isinstance(payload, dict):
+        return dict(payload)
+    return {"products": _extract_records(payload)}
+
+
+def _write_erp_products(
+    products: List[Dict[str, Any]],
+    base_payload: Dict[str, Any] | None = None,
+    *,
+    imported_at: str | None = None,
+    deployment_source: Dict[str, Any] | None = None,
+    persist_change_summary: bool = False,
+) -> Dict[str, Any]:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    stored_payload: Dict[str, Any] = {}
+
+    for key, value in (base_payload or {}).items():
+        if key in PRODUCT_CONTAINER_KEYS or key == CATALOG_META_KEY:
+            continue
+        stored_payload[key] = value
+
+    existing_meta = _extract_catalog_meta(base_payload or {})
+    catalog_meta = dict(existing_meta)
+    current_index = load_erp_index() if persist_change_summary else {}
+    next_index = {str(product.get("Codigo")): product for product in products if _stringify(product.get("Codigo"))}
+    catalog_meta["imported_at"] = imported_at or _stringify(existing_meta.get("imported_at")) or timestamp
+    catalog_meta["updated_at"] = timestamp
+    if deployment_source:
+        catalog_meta.update(
+            {
+                "source_path": str(deployment_source.get("source_path") or "").strip(),
+                "source_name": str(deployment_source.get("source_name") or "").strip(),
+                "source_updated_at": str(deployment_source.get("source_updated_at") or "").strip(),
+            }
+        )
+        parsed_size = _safe_int(deployment_source.get("source_size_bytes"))
+        if parsed_size is not None:
+            catalog_meta["source_size_bytes"] = parsed_size
+    if persist_change_summary:
+        current_path = _stringify(existing_meta.get("source_path"))
+        current_name = _stringify(existing_meta.get("source_name"))
+        active_path = _resolve_json_path()
+        if not current_path and active_path.is_file():
+            current_path = str(active_path)
+        if not current_name and active_path.is_file():
+            current_name = active_path.name
+        catalog_meta["last_change_summary"] = _build_change_summary(
+            next_index,
+            current_index,
+            compared_to_path=current_path,
+            compared_to_name=current_name,
+        )
+
+    stored_payload["imported_at"] = catalog_meta["imported_at"]
+    stored_payload["updated_at"] = timestamp
+    stored_payload["products"] = sort_products_by_category(products)
+    stored_payload[CATALOG_META_KEY] = catalog_meta
+
+    target = _resolve_json_target_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(stored_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    return {
+        "path": str(target),
+        "products_imported": len(stored_payload["products"]),
+        "products_loaded": len(stored_payload["products"]),
+        "imported_at": stored_payload["imported_at"],
+        "updated_at": timestamp,
+        "source_path": _stringify(catalog_meta.get("source_path")),
+        "source_name": _stringify(catalog_meta.get("source_name")),
+        "source_size_bytes": catalog_meta.get("source_size_bytes"),
+        "source_updated_at": _stringify(catalog_meta.get("source_updated_at")) or None,
+        "last_change_summary": catalog_meta.get("last_change_summary"),
+    }
+
+
+def list_erp_products() -> Dict[str, Any]:
+    source = _resolve_json_path()
+    products = sort_products_by_category(list(load_erp_index().values()))
+    meta = _extract_catalog_meta(_load_existing_erp_payload())
+    return {
+        "path": str(source),
+        "exists": source.is_file(),
+        "products_loaded": len(products),
+        "imported_at": _stringify(meta.get("imported_at")) or None,
+        "updated_at": datetime.fromtimestamp(source.stat().st_mtime, tz=timezone.utc).isoformat()
+        if source.is_file()
+        else None,
+        "source_path": _stringify(meta.get("source_path")) or None,
+        "source_name": _stringify(meta.get("source_name")) or None,
+        "source_size_bytes": meta.get("source_size_bytes"),
+        "source_updated_at": _stringify(meta.get("source_updated_at")) or None,
+        "last_change_summary": meta.get("last_change_summary"),
+        "products": products,
+    }
+
+
+def upsert_erp_product(product: Dict[str, Any], code: str | None = None) -> Dict[str, Any]:
+    if not isinstance(product, dict):
+        raise ValueError("invalid ERP product payload")
+
+    payload = dict(product)
+    normalized_code = _normalize_code(code) or _normalize_code(payload.get("Codigo"))
+    if not normalized_code:
+        raise ValueError("product code is required")
+
+    payload["Codigo"] = normalized_code
+    normalized = _normalize_erp_record(payload)
+    if not normalized:
+        raise ValueError("invalid ERP product payload")
+
+    existing_payload = _load_existing_erp_payload()
+    index = load_erp_index()
+    created = normalized_code not in index
+    index[normalized_code] = normalized
+
+    result = _write_erp_products(list(index.values()), base_payload=existing_payload)
+    result["code"] = normalized_code
+    result["created"] = created
+    result["product"] = normalized
+    return result
 
 
 def load_erp_index() -> Dict[str, Dict[str, Any]]:
@@ -752,13 +1263,20 @@ def load_erp_index() -> Dict[str, Dict[str, Any]]:
 def get_erp_status() -> Dict[str, Any]:
     source = _resolve_json_path()
     index = load_erp_index()
+    meta = _extract_catalog_meta(_load_existing_erp_payload())
     return {
         "path": str(source),
         "exists": source.is_file(),
         "products_loaded": len(index),
+        "imported_at": _stringify(meta.get("imported_at")) or None,
         "updated_at": datetime.fromtimestamp(source.stat().st_mtime, tz=timezone.utc).isoformat()
         if source.is_file()
         else None,
+        "source_path": _stringify(meta.get("source_path")) or None,
+        "source_name": _stringify(meta.get("source_name")) or None,
+        "source_size_bytes": meta.get("source_size_bytes"),
+        "source_updated_at": _stringify(meta.get("source_updated_at")) or None,
+        "last_change_summary": meta.get("last_change_summary"),
     }
 
 
@@ -772,6 +1290,7 @@ def _placeholder_urls(code: str) -> tuple[str, str]:
 
 def _merge_single_product(base: Dict[str, Any], erp: Dict[str, Any]) -> Dict[str, Any]:
     merged = dict(base)
+    code = str(erp.get("Codigo") or base.get("Codigo") or "").strip()
 
     for field in ("Nome", "Descricao", "Especificacoes"):
         value = _stringify(erp.get(field))
@@ -810,7 +1329,26 @@ def _merge_single_product(base: Dict[str, Any], erp: Dict[str, Any]) -> Dict[str
             continue
         merged[key] = value
 
-    merged["Codigo"] = str(erp.get("Codigo") or base.get("Codigo") or "").strip()
+    preferred_cover = _preferred_cover_url(
+        merged.get("FotoAmbient"),
+        merged.get("FotoBranco"),
+        merged.get("FotoMedidas"),
+        merged.get("URLFoto"),
+    )
+    if preferred_cover:
+        merged["URLFoto"] = preferred_cover
+    if not _stringify(merged.get("FotoBranco")) and preferred_cover:
+        merged["FotoBranco"] = preferred_cover
+
+    merged["Codigo"] = code
+    if not _stringify(merged.get("Especificacoes")):
+        merged["Especificacoes"] = resolve_technical_specs(
+            code=code,
+            name=_stringify(merged.get("Nome")),
+            description=_stringify(merged.get("Descricao")),
+            category=_stringify(merged.get("Categoria")),
+            extra_fields=merged,
+        )
     return merged
 
 
@@ -827,6 +1365,12 @@ def _create_product_from_erp(erp: Dict[str, Any]) -> Dict[str, Any]:
         dept_code=_stringify(erp.get("CODEPTO")),
         sec_code=_stringify(erp.get("CODSEC")),
     )
+    raw_cover_url = _stringify(erp.get("URLFoto")) or cover_url
+    white_url = _stringify(erp.get("FotoBranco")) or _stringify(erp.get("URLFoto")) or thumb_url
+    ambient_url = _stringify(erp.get("FotoAmbient"))
+    measures_url = _stringify(erp.get("FotoMedidas"))
+    preferred_cover = _preferred_cover_url(ambient_url, white_url, measures_url, raw_cover_url)
+
     created = {
         "Codigo": code,
         "Nome": _stringify(erp.get("Nome")) or f"Produto {code}",
@@ -836,11 +1380,18 @@ def _create_product_from_erp(erp: Dict[str, Any]) -> Dict[str, Any]:
             _stringify(erp.get("Nome")),
             _stringify(erp.get("Descricao")),
         ),
-        "Especificacoes": _stringify(erp.get("Especificacoes")),
-        "URLFoto": _stringify(erp.get("URLFoto")) or cover_url,
-        "FotoBranco": _stringify(erp.get("FotoBranco")) or _stringify(erp.get("URLFoto")) or thumb_url,
-        "FotoAmbient": _stringify(erp.get("FotoAmbient")),
-        "FotoMedidas": _stringify(erp.get("FotoMedidas")),
+        "Especificacoes": resolve_technical_specs(
+            code=code,
+            current_specs=erp.get("Especificacoes"),
+            name=_stringify(erp.get("Nome")),
+            description=_stringify(erp.get("Descricao")),
+            category=inferred_category,
+            extra_fields=erp,
+        ),
+        "URLFoto": preferred_cover,
+        "FotoBranco": white_url or preferred_cover,
+        "FotoAmbient": ambient_url,
+        "FotoMedidas": measures_url,
     }
 
     for key, value in erp.items():

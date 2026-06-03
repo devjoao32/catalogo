@@ -25,7 +25,7 @@ import requests
 from . import onedrive
 
 
-SUPPORTED_EXPORT_FORMATS = {"csv", "json", "xlsx", "xls", "pdf", "zip"}
+SUPPORTED_EXPORT_FORMATS = {"csv", "json", "xlsx", "xls", "pdf", "ficha", "zip"}
 PREFERRED_COLUMNS = (
     "Codigo",
     "Nome",
@@ -224,16 +224,24 @@ def _filter_products(
     query: str = "",
     category: str = "",
     code: str = "",
+    brand: str = "",
 ) -> List[Dict[str, Any]]:
     normalized_query = _normalize_text(query)
     normalized_category = _normalize_text(category)
     normalized_code = str(code or "").strip()
+    normalized_brand = _normalize_text(brand)
     filtered: List[Dict[str, Any]] = []
 
     for product in products:
         product_code = _stringify(product.get("Codigo"))
         if normalized_code and product_code != normalized_code:
             continue
+
+        if normalized_brand:
+            product_brand_code = _stringify(product.get("CODMARCA"))
+            product_brand = "pienza" if product_brand_code == "2" else "nitrolux"
+            if product_brand != normalized_brand:
+                continue
 
         if normalized_category and normalized_category != "todas":
             product_category = _normalize_text(product.get("Categoria"))
@@ -431,6 +439,167 @@ def _paste_fitted_image(
     page.paste(canvas, (left, top))
 
 
+def _paste_cover_image(
+    page: Image.Image,
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+) -> None:
+    left, top, right, bottom = box
+    available = (max(1, right - left), max(1, bottom - top))
+    fitted = ImageOps.fit(image, available, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+    page.paste(fitted, (left, top))
+
+
+def _paste_cutout_image(
+    page: Image.Image,
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    *,
+    background_threshold: int = 238,
+) -> None:
+    left, top, right, bottom = box
+    available = (max(1, right - left), max(1, bottom - top))
+    fitted = ImageOps.contain(image.convert("RGB"), available)
+    rgba = fitted.convert("RGBA")
+    pixels = rgba.load()
+    for y in range(rgba.height):
+        for x in range(rgba.width):
+            red, green, blue, alpha = pixels[x, y]
+            if red >= background_threshold and green >= background_threshold and blue >= background_threshold:
+                pixels[x, y] = (red, green, blue, 0)
+            else:
+                pixels[x, y] = (red, green, blue, alpha)
+    offset = (left + (available[0] - fitted.width) // 2, top + (available[1] - fitted.height) // 2)
+    page.paste(rgba, offset, rgba)
+
+
+def _strip_power_unit(value: str) -> str:
+    normalized = _stringify(value).upper()
+    match = re.search(r"\d+(?:[.,]\d+)?", normalized)
+    return match.group(0).replace(",", ".") if match else normalized
+
+
+def _field_lookup(product: Dict[str, Any]) -> Dict[str, str]:
+    return {re.sub(r"[^a-z0-9]+", "", _normalize_text(key)): _stringify(value) for key, value in product.items()}
+
+
+def _parse_specs_pairs(specs: str) -> List[tuple[str, str]]:
+    pairs: List[tuple[str, str]] = []
+    for part in re.split(r"[|\n;]+", str(specs or "")):
+        clean = part.strip()
+        if not clean:
+            continue
+        match = re.match(r"^([^:=-]+)\s*[:=-]\s*(.+)$", clean)
+        if not match:
+            continue
+        label = match.group(1).strip()
+        value = match.group(2).strip()
+        if label and value:
+            pairs.append((label, value))
+    return pairs
+
+
+def _normalize_lookup_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _normalize_text(value))
+
+
+def _spec_lookup(product: Dict[str, Any], specs: str) -> Dict[str, str]:
+    lookup = _field_lookup(product)
+    for label, value in _parse_specs_pairs(specs):
+        lookup.setdefault(_normalize_lookup_key(label), value)
+    return lookup
+
+
+def _pick_spec_value(lookup: Dict[str, str], aliases: Sequence[str]) -> str:
+    for alias in aliases:
+        normalized_alias = _normalize_lookup_key(alias)
+        if lookup.get(normalized_alias):
+            return lookup[normalized_alias]
+    for alias in aliases:
+        normalized_alias = _normalize_lookup_key(alias)
+        if len(normalized_alias) <= 3:
+            continue
+        for key, value in lookup.items():
+            if value and normalized_alias in key:
+                return value
+    return ""
+
+
+def _regex_value(text: str, patterns: Sequence[str]) -> str:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return re.sub(r"\s+", " ", match.group(0)).strip().upper()
+    return ""
+
+
+def _technical_sheet_rows(product: Dict[str, Any], specs: str) -> List[tuple[str, str]]:
+    lookup = _spec_lookup(product, specs)
+    search_text = " | ".join(
+        _stringify(value)
+        for value in (
+            product.get("Nome"),
+            product.get("Descricao"),
+            product.get("Categoria"),
+            specs,
+        )
+        if _stringify(value)
+    )
+
+    rows = [
+        ("Potencia", _pick_spec_value(lookup, ("potencia", "potencia(w)", "watt", "watts")) or _regex_value(search_text, (r"\b\d+(?:[.,]\d+)?\s*W(?:/M)?\b",))),
+        ("Tensao", _pick_spec_value(lookup, ("tensao", "tensao(v)", "voltagem", "voltagem(v)")) or _regex_value(search_text, (r"\b(?:AC|DC)?\s*\d+(?:[.,]\d+)?(?:\s*[-/]\s*\d+(?:[.,]\d+)?)?\s*V\b", r"\bBIVOLT\b"))),
+        ("Temperatura de cor", _pick_spec_value(lookup, ("temperatura de cor", "temp. cor(k)", "temp cor", "cct", "kelvin")) or _regex_value(search_text, (r"\b\d{4,5}\s*K\b",))),
+        ("Fluxo luminoso", _pick_spec_value(lookup, ("fluxo luminoso", "lumens", "lumen")) or _regex_value(search_text, (r"\b\d+(?:[.,]\d+)?\s*LM\b",))),
+        ("IRC", _pick_spec_value(lookup, ("irc", "cri")) or _regex_value(search_text, (r"\b(?:IRC|CRI)\s*[=:]?\s*[><=]*\s*\d{2,3}\b",))),
+        ("Fator de potencia", _pick_spec_value(lookup, ("fator de potencia", "fp")) or _regex_value(search_text, (r"\b(?:FP|FATOR\s+DE\s+POTENCIA)\s*[=:]?\s*[><=]*\s*\d+(?:[.,]\d+)?\b",))),
+        ("Angulo de abertura", _pick_spec_value(lookup, ("angulo de abertura", "angulo", "abertura"))),
+        ("Grau de protecao", _pick_spec_value(lookup, ("indice de protecao", "grau de protecao", "ip")) or _regex_value(search_text, (r"\bIP\s*\d{2}\b",))),
+        ("Material", _pick_spec_value(lookup, ("material", "materia prima"))),
+        ("Acabamento", _pick_spec_value(lookup, ("acabamento", "cor", "cores disponiveis"))),
+        ("Medidas", _pick_spec_value(lookup, ("dimensoes", "dimensao", "medidas")) or _regex_value(search_text, (r"(?:Ø\s*)?\d+(?:[.,]\d+)?(?:\s*[xX]\s*(?:Ø\s*)?\d+(?:[.,]\d+)?){1,3}\s*MM\b",))),
+        ("Peso", _pick_spec_value(lookup, ("peso", "peso liquido", "pesoliq", "peso bruto", "pesobruto"))),
+        ("Garantia", _pick_spec_value(lookup, ("garantia",)) or _regex_value(search_text, (r"\b\d+\s*(?:ANO|ANOS|MES|MESES)\b",))),
+    ]
+
+    return [(label, value) for label, value in rows if _stringify(value)]
+
+
+def _draw_dotted_row(
+    draw: ImageDraw.ImageDraw,
+    *,
+    label: str,
+    value: str,
+    x: int,
+    y: int,
+    width: int,
+    label_font: ImageFont.ImageFont,
+    value_font: ImageFont.ImageFont,
+) -> int:
+    label_width, label_height = _measure_text(draw, label, label_font)
+    value_width, _ = _measure_text(draw, value, value_font)
+    value_x = x + width - value_width
+    line_y = y + label_height - 6
+    dot_start = x + label_width + 14
+    dot_end = value_x - 14
+    draw.text((x, y), label, fill="#171717", font=label_font)
+    if dot_end > dot_start:
+        for dot_x in range(dot_start, dot_end, 9):
+            draw.line((dot_x, line_y, min(dot_x + 4, dot_end), line_y), fill="#b6b1ab", width=1)
+    draw.text((value_x, y), value, fill="#171717", font=value_font)
+    return y + label_height + 18
+
+
+def _fit_title_font(draw: ImageDraw.ImageDraw, text: str, max_width: int, start_size: int, *, bold: bool = True) -> ImageFont.ImageFont:
+    size = start_size
+    while size >= 24:
+        font = _load_font(size, bold=bold)
+        if _measure_text(draw, text, font)[0] <= max_width:
+            return font
+        size -= 2
+    return _load_font(24, bold=bold)
+
+
 def _draw_metric_card(
     draw: ImageDraw.ImageDraw,
     *,
@@ -586,138 +755,215 @@ def _open_image_for_export(url: str) -> Image.Image | None:
 
 
 def _build_product_pdf_pages(product: Dict[str, Any]) -> List[Image.Image]:
-    brand_font = _load_font(68, bold=True)
-    title_font = _load_font(28, bold=True)
-    product_font = _load_font(36, bold=True)
+    brand_font = _load_font(46, bold=True)
+    document_font = _load_font(32, bold=True)
+    title_font = _load_font(40, bold=True)
     section_font = _load_font(24, bold=True)
     body_font = _load_font(20)
     small_font = _load_font(16)
-    tiny_font = _load_font(13, bold=True)
+    tiny_font = _load_font(12, bold=True)
+    table_font = _load_font(17)
+    table_value_font = _load_font(17, bold=True)
+    footer_font = _load_font(15)
     code = _stringify(product.get("Codigo"))
     name = _stringify(product.get("Nome")) or f"Produto {code}"
-    category = _stringify(product.get("Categoria")) or "Sem categoria"
-    description = _stringify(product.get("Descricao")) or "Sem descricao cadastrada."
-    specs = _stringify(product.get("Especificacoes")) or "Sem especificacoes cadastradas."
-    attributes = _product_attributes(product)
-    banner = _load_brand_banner()
-    images = [image for image in (_open_image_for_export(item["url"]) for item in _photo_references(product)[:4]) if image is not None]
+    category = _stringify(product.get("Categoria")) or "PRODUTO"
+    description = _stringify(product.get("Descricao")) or _stringify(product.get("Categoria")) or "Produto para catálogo técnico."
+    specs = _stringify(product.get("Especificacoes")) or "Sem especificações cadastradas."
+    brand_code = _stringify(product.get("CODMARCA"))
+    brand_name = "PIENZA" if brand_code in {"2", "2.0"} else "NITROLUX"
+    brand_site = "pienza.com.br" if brand_name == "PIENZA" else "nitrolux.com.br"
+    accent = "#b8892f" if brand_name == "PIENZA" else "#0f5da8"
+    dark = "#172234"
+    muted = "#667085"
+    border = "#d9e2ec"
+    footer_text = f"{brand_site} | Ficha técnica gerada pelo Catálogo"
 
-    featured_metrics = [
-        ("Codigo", code),
-        ("Codigo de barras", _stringify(product.get("CODAUXILIAR"))),
+    photo_map: Dict[str, Image.Image] = {}
+    for label, key in PHOTO_FIELDS:
+        url = _stringify(product.get(key))
+        if url:
+            image = _open_image_for_export(url)
+            if image is not None:
+                photo_map[key] = image
+    if "URLFoto" not in photo_map:
+        for reference in _photo_references(product):
+            image = _open_image_for_export(reference["url"])
+            if image is not None:
+                photo_map["URLFoto"] = image
+                break
+
+    product_image = photo_map.get("FotoBranco") or photo_map.get("URLFoto") or photo_map.get("FotoAmbient")
+    ambient_image = photo_map.get("FotoAmbient") or photo_map.get("URLFoto") or photo_map.get("FotoBranco")
+    measures_image = photo_map.get("FotoMedidas")
+    technical_rows = _technical_sheet_rows(product, specs)
+
+    quick_lookup = _spec_lookup(product, specs)
+    power = _pick_spec_value(quick_lookup, ("potencia", "potencia(w)", "watt", "watts")) or _regex_value(specs, (r"\b\d+(?:[.,]\d+)?\s*W(?:/M)?\b",))
+    voltage = _pick_spec_value(quick_lookup, ("tensao", "tensao(v)", "voltagem")) or _regex_value(specs, (r"\b(?:AC|DC)?\s*\d+(?:[.,]\d+)?(?:\s*[-/]\s*\d+(?:[.,]\d+)?)?\s*V\b", r"\bBIVOLT\b"))
+    protection = _pick_spec_value(quick_lookup, ("indice de protecao", "grau de protecao", "ip")) or _regex_value(specs, (r"\bIP\s*\d{2}\b",))
+    base = _pick_spec_value(quick_lookup, ("base", "soquete", "bocal")) or _regex_value(specs, (r"\b(?:E27/E40|E27/40|E27|E14|E40|GU10|G9X\d+|G9|G13)\b",))
+    color_temp = _pick_spec_value(quick_lookup, ("temperatura de cor", "temp. cor(k)", "cct")) or _regex_value(specs, (r"\b\d{4,5}\s*K\b",))
+    finish = _pick_spec_value(quick_lookup, ("acabamento", "cor", "cores disponiveis"))
+    material = _pick_spec_value(quick_lookup, ("material", "materia prima"))
+    dimensions = _pick_spec_value(quick_lookup, ("dimensoes", "dimensao", "medidas"))
+
+    highlight_candidates = [
+        ("Potência", power),
+        ("Tensão", voltage),
+        ("Temperatura", color_temp),
+        ("Proteção", protection),
+        ("Base", base),
+        ("Material", material),
+        ("Acabamento", finish),
+        ("Medidas", dimensions),
+        ("Embalagem", _stringify(product.get("EMBALAGEM"))),
         ("NCM", _stringify(product.get("NBM"))),
-        ("IPI", _stringify(product.get("PERCIPIVENDA"))),
+        ("Categoria", category),
+        ("Código", code),
     ]
-    highlighted_attributes = [
-        (label, value)
-        for label, value in attributes
-        if label not in {"CODPROD", "CODAUXILIAR", "NBM", "PERCIPIVENDA"}
-    ]
+    highlights: List[tuple[str, str]] = []
+    seen_highlights: set[str] = set()
+    for label, value in highlight_candidates:
+        value = _stringify(value)
+        if not value:
+            continue
+        normalized_label = _normalize_lookup_key(label)
+        if normalized_label in seen_highlights:
+            continue
+        highlights.append((label, value))
+        seen_highlights.add(normalized_label)
+        if len(highlights) == 4:
+            break
+
+    enriched_rows = list(technical_rows)
+    seen_rows = {_normalize_lookup_key(label) for label, _ in enriched_rows}
+    for label, value in _parse_specs_pairs(specs):
+        normalized_label = _normalize_lookup_key(label)
+        if normalized_label in {"codigo", "cod"} or normalized_label in seen_rows:
+            continue
+        enriched_rows.append((label, value))
+        seen_rows.add(normalized_label)
+    for label, key in (
+        ("Código de barras", "CODAUXILIAR"),
+        ("NCM", "NBM"),
+        ("IPI", "PERCIPIVENDA"),
+        ("Categoria", "Categoria"),
+    ):
+        value = _stringify(product.get(key))
+        normalized_label = _normalize_lookup_key(label)
+        if value and normalized_label not in seen_rows:
+            enriched_rows.append((label, value))
+            seen_rows.add(normalized_label)
 
     pages: List[Image.Image] = []
-    page, draw = _new_pdf_page()
-    hero_box = (60, 56, 1180, 288)
-    _rounded_box(draw, hero_box, fill="#123f87", radius=36)
-    if banner is not None:
-        _paste_fitted_image(page, banner, (60, 56, 420, 288), background="#123f87")
-        draw.rounded_rectangle((60, 56, 420, 288), radius=36, outline=None, fill=None)
-        draw.rectangle((280, 56, 420, 288), fill="#123f87")
+    page = Image.new("RGB", PAGE_SIZE, "#f5f7fa")
+    draw = ImageDraw.Draw(page)
 
-    draw.text((444, 90), "NITROLUX", fill="white", font=brand_font)
-    draw.text((448, 170), "FICHA TECNICA DO PRODUTO", fill="#dbe8ff", font=title_font)
-    draw.text((448, 210), f"Categoria: {category}", fill="#f3f7ff", font=body_font)
+    draw.rectangle((0, 0, PAGE_SIZE[0], 18), fill=accent)
+    draw.rectangle((0, 18, PAGE_SIZE[0], 152), fill="#ffffff")
+    draw.text((72, 58), brand_name, fill=dark, font=brand_font)
+    draw.text((760, 52), "FICHA TÉCNICA", fill=dark, font=document_font)
+    draw.text((762, 94), f"Código {code or '-'}", fill=muted, font=body_font)
+    draw.line((72, 152, 1168, 152), fill=border, width=2)
 
-    code_box = (942, 96, 1138, 204)
-    _rounded_box(draw, code_box, fill="#ffffff", radius=28)
-    draw.text((970, 118), "CODIGO", fill="#5b7caa", font=tiny_font)
-    draw.text((970, 144), code or "-", fill="#123874", font=_load_font(42, bold=True))
+    left_x = 72
+    right_x = 660
+    top_y = 194
 
-    info_box = (60, 330, 570, 980)
-    photo_box = (598, 330, 1180, 980)
-    _rounded_box(draw, info_box, fill="#ffffff", outline="#d7e7ff", radius=32)
-    _rounded_box(draw, photo_box, fill="#ffffff", outline="#d7e7ff", radius=32)
-
-    desc_y = _draw_wrapped_text(
-        draw,
-        text=name,
-        font=product_font,
-        x=88,
-        y=360,
-        max_width=430,
-        fill="#123874",
-        line_spacing=8,
-    )
-    desc_y = _draw_wrapped_text(
-        draw,
-        text=description,
-        font=body_font,
-        x=88,
-        y=desc_y + 18,
-        max_width=430,
-        fill="#31557f",
-        line_spacing=8,
-    )
-    draw.text((88, desc_y + 18), "ESPECIFICACOES", fill="#5b7caa", font=tiny_font)
-    _draw_wrapped_text(
-        draw,
-        text=specs,
-        font=body_font,
-        x=88,
-        y=desc_y + 48,
-        max_width=430,
-        fill="#153662",
-        line_spacing=8,
-    )
-
-    if images:
-        _paste_fitted_image(page, images[0], (632, 364, 1146, 804))
+    _rounded_box(draw, (left_x, top_y, 600, 760), fill="#ffffff", outline=border, radius=24, width=2)
+    if product_image is not None:
+        _paste_fitted_image(page, product_image, (104, top_y + 34, 568, 724), background="#ffffff")
     else:
-        placeholder_font = _load_font(24, bold=True)
-        draw.rounded_rectangle((632, 364, 1146, 804), radius=26, fill="#f5f9ff", outline="#e4eefc", width=2)
-        draw.text((744, 560), "SEM FOTO", fill="#7d96ba", font=placeholder_font)
+        draw.rectangle((134, 360, 538, 596), fill="#f7f8fa", outline=border, width=2)
+        draw.text((276, 462), "SEM FOTO", fill=muted, font=section_font)
 
-    draw.text((632, 830), "IMAGENS DO PRODUTO", fill="#5b7caa", font=tiny_font)
-    thumb_y = 860
-    thumb_width = 150
-    thumb_gap = 18
-    for index, image in enumerate(images[1:4], start=0):
-        left = 632 + index * (thumb_width + thumb_gap)
-        box = (left, thumb_y, left + thumb_width, thumb_y + 100)
-        _rounded_box(draw, box, fill="#f7fbff", outline="#e4eefc", radius=18)
-        _paste_fitted_image(page, image, (left + 6, thumb_y + 6, left + thumb_width - 6, thumb_y + 94), background="#f7fbff")
+    draw.text((right_x, top_y), category.upper(), fill=accent, font=_load_font(18, bold=True))
+    title_y = top_y + 38
+    product_title_font = _fit_title_font(draw, name.upper(), 500, 40)
+    title_lines = _wrap_text(draw, name.upper(), product_title_font, 500)[:4]
+    for line in title_lines:
+        draw.text((right_x, title_y), line, fill=dark, font=product_title_font)
+        title_y += _measure_text(draw, "Ag", product_title_font)[1] + 10
 
-    metric_width = 244
-    metric_gap = 16
-    metric_top = 1008
-    for index, (label, value) in enumerate(featured_metrics):
-        left = 60 + index * (metric_width + metric_gap)
+    code_label = f"COD. {code or '-'}"
+    code_width, code_height = _measure_text(draw, code_label, _load_font(22, bold=True))
+    draw.rounded_rectangle(
+        (right_x, title_y + 12, right_x + code_width + 28, title_y + code_height + 32),
+        radius=8,
+        fill=accent,
+    )
+    draw.text((right_x + 14, title_y + 20), code_label, fill="#ffffff", font=_load_font(22, bold=True))
+
+    summary_y = title_y + 86
+    draw.text((right_x, summary_y), "Resumo do produto", fill=dark, font=section_font)
+    desc_y = summary_y + 42
+    desc_y = _draw_wrapped_text(draw, text=description, font=body_font, x=right_x, y=desc_y, max_width=500, fill="#344054", line_spacing=8)
+    if material or finish:
+        meta = " | ".join(value for value in (material, finish) if value)
+        _draw_wrapped_text(draw, text=meta, font=small_font, x=right_x, y=desc_y + 16, max_width=500, fill=muted, line_spacing=6)
+
+    card_y = 812
+    card_gap = 18
+    card_width = (PAGE_SIZE[0] - 144 - card_gap * 3) // 4
+    for index, (label, value) in enumerate(highlights):
+        card_left = 72 + index * (card_width + card_gap)
         _draw_metric_card(
             draw,
-            box=(left, metric_top, left + metric_width, metric_top + 130),
+            box=(card_left, card_y, card_left + card_width, card_y + 118),
             label=label,
-            value=value or "-",
+            value=value,
             label_font=tiny_font,
             value_font=_load_font(22, bold=True),
         )
 
-    metadata_box = (60, 1168, 1180, 1662)
-    used = _draw_attribute_grid(
-        draw,
-        attributes=highlighted_attributes,
-        box=metadata_box,
-        columns=2,
-        section_font=section_font,
-        label_font=tiny_font,
-        value_font=small_font,
-        title="DETALHES TECNICOS",
-    )
+    table_box = (72, 982, 738, 1570)
+    _rounded_box(draw, table_box, fill="#ffffff", outline=border, radius=24, width=2)
+    draw.text((104, 1014), "Informações técnicas", fill=dark, font=section_font)
+    row_y = 1068
+    table_rows = enriched_rows or [("Especificações", specs)]
+    for index, (label, value) in enumerate(table_rows[:14]):
+        row_fill = "#f8fafc" if index % 2 == 0 else "#ffffff"
+        draw.rectangle((104, row_y - 8, 706, row_y + 34), fill=row_fill)
+        draw.text((124, row_y), label, fill="#475467", font=table_font)
+        value_lines = _wrap_text(draw, value, table_value_font, 276)[:2]
+        value_y = row_y
+        for line in value_lines:
+            draw.text((420, value_y), line, fill=dark, font=table_value_font)
+            value_y += 21
+        row_y += 44 if len(value_lines) <= 1 else 62
+        if row_y > 1518:
+            break
 
-    footer_font = _load_font(14)
-    footer_text = f"Gerado em {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M UTC')}"
-    draw.text((60, 1688), footer_text, fill="#6d82a6", font=footer_font)
+    gallery_box = (778, 982, 1168, 1570)
+    _rounded_box(draw, gallery_box, fill="#ffffff", outline=border, radius=24, width=2)
+    draw.text((810, 1014), "Imagens de apoio", fill=dark, font=section_font)
+    image_slots = [
+        ("Ambientada", ambient_image),
+        ("Medidas", measures_image),
+    ]
+    slot_y = 1068
+    for label, image in image_slots:
+        draw.text((810, slot_y), label, fill="#475467", font=small_font)
+        if image is not None:
+            _paste_fitted_image(page, image, (810, slot_y + 30, 1136, slot_y + 218), background="#ffffff")
+        else:
+            draw.rounded_rectangle((810, slot_y + 30, 1136, slot_y + 218), radius=16, fill="#f8fafc", outline=border, width=2)
+            draw.text((916, slot_y + 108), "Não informado", fill=muted, font=small_font)
+        slot_y += 246
+
+    draw.rectangle((0, 1660, PAGE_SIZE[0], PAGE_SIZE[1]), fill=dark)
+    draw.text((72, 1692), footer_text, fill="#ffffff", font=footer_font)
+    disclaimer = "Dados sujeitos à conferência conforme cadastro e lote do produto."
+    disclaimer_width, _ = _measure_text(draw, disclaimer, footer_font)
+    draw.text((PAGE_SIZE[0] - 72 - disclaimer_width, 1692), disclaimer, fill="#cbd5e1", font=footer_font)
     pages.append(page)
 
-    remaining_attributes = highlighted_attributes[used:]
+    remaining_attributes = [
+        (label, value)
+        for label, value in _product_attributes(product)
+        if label not in {"CODPROD", "CODAUXILIAR", "NBM", "PERCIPIVENDA"}
+    ][18:]
     while remaining_attributes:
         extra_page, extra_draw = _new_pdf_page()
         header_box = (60, 56, 1180, 196)
@@ -910,7 +1156,7 @@ def _response_metadata(format_name: str, *, base_name: str) -> tuple[str, str]:
         )
     if normalized == "json":
         return "application/json; charset=utf-8", f"{base_name}.json"
-    if normalized == "pdf":
+    if normalized in {"pdf", "ficha"}:
         return "application/pdf", f"{base_name}.pdf"
     if normalized == "zip":
         return "application/zip", f"{base_name}.zip"
@@ -923,17 +1169,24 @@ def build_catalog_export(
     query: str = "",
     category: str = "",
     code: str = "",
+    brand: str = "",
 ) -> tuple[bytes, str, str]:
     normalized_format = format_name.lower().strip()
     if normalized_format not in SUPPORTED_EXPORT_FORMATS:
         raise ValueError("unsupported export format")
 
-    products = _filter_products(_load_products(), query=query, category=category, code=code)
+    products = _filter_products(_load_products(), query=query, category=category, code=code, brand=brand)
     if not products:
         raise ValueError("no products available for the selected export")
+    if normalized_format == "ficha" and not code:
+        raise ValueError("technical sheet export requires a product code")
 
-    if code:
+    if normalized_format == "ficha" and code:
+        base_name = f"ficha-tecnica-{_slugify(code, fallback='produto')}"
+    elif code:
         base_name = f"produto-{_slugify(code, fallback='item')}"
+    elif brand:
+        base_name = f"catalogo-{_slugify(brand)}"
     elif category and _normalize_text(category) != "todas":
         base_name = f"catalogo-{_slugify(category)}"
     else:
@@ -945,7 +1198,7 @@ def build_catalog_export(
         payload = _build_xlsx_bytes(products)
     elif normalized_format == "json":
         payload = _build_json_bytes(products, query=query, category=category, code=code)
-    elif normalized_format == "pdf":
+    elif normalized_format in {"pdf", "ficha"}:
         payload = _build_pdf_bytes(products, query=query, category=category, code=code)
     else:
         payload = _build_zip_bytes(products, query=query, category=category, code=code, base_name=base_name)

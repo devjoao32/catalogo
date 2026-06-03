@@ -63,6 +63,40 @@ async def upload_erp_file(request: Request, filename: str | None = None):
         return internal_server_error_response()
 
 
+@router.post("/erp/stage-file")
+async def stage_erp_file_upload(request: Request, filename: str | None = None):
+    """Recebe um arquivo JSON bruto, valida e deixa pronto para implantacao."""
+    try:
+        from ...erp_catalog import get_max_upload_size_bytes, stage_erp_file
+
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                declared_length = 0
+            if declared_length > get_max_upload_size_bytes():
+                return JSONResponse(status_code=413, content={"error": "ERP upload too large"})
+
+        body = await request.body()
+        if not body:
+            return JSONResponse(status_code=400, content={"error": "empty request body"})
+
+        selected_name = (
+            filename
+            or request.headers.get("x-file-name")
+            or request.headers.get("x-filename")
+            or "erp_upload.json"
+        )
+
+        return stage_erp_file(filename=selected_name, content=body)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except Exception as exc:
+        logger.exception("Error staging ERP file: %s", exc)
+        return internal_server_error_response()
+
+
 @router.post("/erp/import-file")
 async def import_erp_file_from_backend(payload: dict = Body(...)):
     """Importa um arquivo JSON ja depositado no backend."""
@@ -90,6 +124,52 @@ async def list_backend_erp_files():
         return {"files": list_erp_files()}
     except Exception as exc:
         logger.exception("Error listing ERP files: %s", exc)
+        return internal_server_error_response()
+
+
+@router.get("/erp/files/preview")
+async def preview_backend_erp_file(file_path: str | None = None):
+    """Gera um resumo de um arquivo JSON antes da implantacao."""
+    try:
+        selected_path = str(file_path or "").strip()
+        if not selected_path:
+            return JSONResponse(status_code=400, content={"error": "missing file_path"})
+
+        from ...erp_catalog import preview_erp_file
+
+        return preview_erp_file(selected_path)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except Exception as exc:
+        logger.exception("Error previewing ERP file: %s", exc)
+        return internal_server_error_response()
+
+
+@router.get("/erp/products")
+async def list_backend_erp_products():
+    """Lista os produtos atualmente persistidos no JSON ERP ativo."""
+    try:
+        from ...erp_catalog import list_erp_products
+
+        return list_erp_products()
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except Exception as exc:
+        logger.exception("Error listing ERP products: %s", exc)
+        return internal_server_error_response()
+
+
+@router.put("/erp/products/{codigo}")
+async def save_backend_erp_product(codigo: str, payload: dict = Body(...)):
+    """Atualiza ou inclui um produto individual no JSON ERP ativo."""
+    try:
+        from ...erp_catalog import upsert_erp_product
+
+        return upsert_erp_product(payload, code=codigo)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except Exception as exc:
+        logger.exception("Error saving ERP product %s: %s", codigo, exc)
         return internal_server_error_response()
 
 

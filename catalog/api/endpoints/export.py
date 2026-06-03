@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse, Response
 
 from ..errors import internal_server_error_response
+from ..security import require_representative_access
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_representative_access)])
 logger = logging.getLogger(__name__)
 
 
@@ -20,6 +21,7 @@ async def export_catalog(
     query: str | None = None,
     category: str | None = None,
     code: str | None = None,
+    brand: str | None = None,
 ):
     """Gera uma exportacao do catalogo em CSV, Excel, JSON, PDF ou ZIP."""
     try:
@@ -30,6 +32,7 @@ async def export_catalog(
             query=str(query or "").strip(),
             category=str(category or "").strip(),
             code=str(code or "").strip(),
+            brand=str(brand or "").strip(),
         )
         return Response(
             content=payload,

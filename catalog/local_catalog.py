@@ -34,6 +34,7 @@ def _env_flag(name: str, default: bool = True) -> bool:
 
 def _local_products_paths(base_dir: str) -> List[str]:
     return [
+        os.path.join(base_dir, "TI 1", "catalogo"),
         os.path.join(base_dir, "FOTOS_PRODUTOS"),
         os.path.join(base_dir, "MARKETING", "01_PRODUTOS", "BACKUP PRODUTOS"),
         os.path.join(base_dir, "MARKETING", "Catalogo"),
@@ -281,7 +282,7 @@ def scan_local_photo_index(
             if lowered_name.endswith(IMG_EXTENSIONS):
                 file_info = {"name": filename, "full_path": full_path, "rel_path": rel_path}
                 record["files"].append(file_info)
-                variant = _classify_variant(filename)
+                variant = _classify_variant(filename, code)
                 if variant in record["variants"] and record["variants"][variant] is None:
                     record["variants"][variant] = file_info
                 continue
@@ -301,12 +302,17 @@ def scan_local_photo_index(
                 "rel_path": target_rel_path,
             }
             record["files"].append(file_info)
-            variant = _classify_variant(link_name)
+            variant = _classify_variant(link_name, code)
             if variant in record["variants"] and record["variants"][variant] is None:
                 record["variants"][variant] = file_info
 
     for record in index.values():
         record["files"].sort(key=lambda item: _local_file_sort_key(item, record.get("code", "")))
+        explicitly_assigned = {
+            item["rel_path"]
+            for item in record["variants"].values()
+            if item and item.get("rel_path")
+        }
         chosen = set()
 
         white = record["variants"]["white_background"]
@@ -320,14 +326,22 @@ def scan_local_photo_index(
         if ambient:
             chosen.add(ambient["rel_path"])
         else:
-            fallback = _pick_distinct_fallback(record["files"], chosen)
+            fallback_pool = [
+                item for item in record["files"]
+                if item.get("rel_path") not in explicitly_assigned
+            ]
+            fallback = _pick_distinct_fallback(fallback_pool, chosen)
             if fallback:
                 record["variants"]["ambient"] = fallback
                 chosen.add(fallback["rel_path"])
 
         measures = record["variants"]["measures"]
         if not measures:
-            fallback = _pick_distinct_fallback(record["files"], chosen)
+            fallback_pool = [
+                item for item in record["files"]
+                if item.get("rel_path") not in explicitly_assigned
+            ]
+            fallback = _pick_distinct_fallback(fallback_pool, chosen)
             if fallback:
                 record["variants"]["measures"] = fallback
 

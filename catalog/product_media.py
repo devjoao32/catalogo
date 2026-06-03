@@ -36,7 +36,16 @@ def _match_filename(name: str, code: str):
     return 0
 
 
-def _classify_variant(name: str) -> str:
+def _classify_variant(name: str, code: str = "") -> str:
+    if code:
+        numeric_variant = _match_filename(name, str(code))
+        if numeric_variant == 1:
+            return "white_background"
+        if numeric_variant == 2:
+            return "measures"
+        if numeric_variant == 3:
+            return "ambient"
+
     lowered = name.lower()
     if "branco" in lowered or "white" in lowered:
         return "white_background"

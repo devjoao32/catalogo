@@ -7,6 +7,8 @@ import os
 import re
 from typing import Callable, Dict, List
 
+from .technical_specs import resolve_technical_specs
+
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,14 @@ def _is_placeholder_photo(value: object) -> bool:
     return not text or "placehold.co" in text
 
 
+def _first_real_photo(*values: object) -> str:
+    for value in values:
+        text = _stringify(value)
+        if text and not _is_placeholder_photo(text):
+            return text
+    return ""
+
+
 def _needs_resolved_photos(product: Dict) -> bool:
     return any(
         _is_placeholder_photo(product.get(field))
@@ -57,7 +67,7 @@ def _resolved_photo_fields(record: Dict, asset_url: Callable[[str], str]) -> Dic
     white_url = asset_url(white["rel_path"]) if white else ""
     ambient_url = asset_url(ambient["rel_path"]) if ambient else ""
     measures_url = asset_url(measures["rel_path"]) if measures else ""
-    cover_url = white_url
+    cover_url = _first_real_photo(ambient_url, white_url, measures_url)
     return {
         "URLFoto": cover_url,
         "FotoBranco": white_url or cover_url,
@@ -71,27 +81,20 @@ def _apply_resolved_photos(product: Dict, resolved_fields: Dict[str, str]) -> Di
 
     existing_cover = _stringify(merged.get("URLFoto"))
     resolved_cover = _stringify(resolved_fields.get("URLFoto"))
-    cover = existing_cover
-    if _is_placeholder_photo(existing_cover) and resolved_cover:
-        cover = resolved_cover
 
-    existing_white = _stringify(merged.get("FotoBranco")) or existing_cover or cover
+    existing_white = _stringify(merged.get("FotoBranco")) or existing_cover
     resolved_white = _stringify(resolved_fields.get("FotoBranco")) or resolved_cover
-    white = existing_white
-    if _is_placeholder_photo(existing_white) and resolved_white:
-        white = resolved_white
+    white = _first_real_photo(resolved_white, existing_white, existing_cover)
 
     existing_ambient = _stringify(merged.get("FotoAmbient"))
     resolved_ambient = _stringify(resolved_fields.get("FotoAmbient"))
-    ambient = existing_ambient
-    if _is_placeholder_photo(existing_ambient) and resolved_ambient:
-        ambient = resolved_ambient
+    ambient = _first_real_photo(resolved_ambient, existing_ambient)
 
     existing_measures = _stringify(merged.get("FotoMedidas"))
     resolved_measures = _stringify(resolved_fields.get("FotoMedidas"))
-    measures = existing_measures
-    if _is_placeholder_photo(existing_measures) and resolved_measures:
-        measures = resolved_measures
+    measures = _first_real_photo(resolved_measures, existing_measures)
+
+    cover = _first_real_photo(ambient, white, measures, resolved_cover, existing_cover)
 
     if cover:
         merged["URLFoto"] = cover
@@ -156,13 +159,17 @@ def list_local_products(
     code_sort_key: Callable[[str], tuple[int, int | str]],
 ) -> List[Dict]:
     from .erp_catalog import merge_products_with_erp
+    from .nitrolux_db import merge_products_with_nitrolux
+    from .stock_catalog import merge_products_with_stock_sales
 
     index = get_local_index(path_override)
     if not index and path_override is None:
         stock_products = load_stock_products()
         if stock_products:
             enriched_stock_products = enrich_stock_products_with_photos(stock_products)
-            return merge_products_with_erp(enriched_stock_products)
+            merged_stock_products = merge_products_with_erp(enriched_stock_products)
+            merged_stock_products = merge_products_with_stock_sales(merged_stock_products)
+            return merge_products_with_nitrolux(merged_stock_products)
 
     cadastro_records = load_cadastro_records(path_override)
     products: List[Dict] = []
@@ -175,11 +182,19 @@ def list_local_products(
         white_url = asset_url(white["rel_path"]) if white else ""
         ambient_url = asset_url(ambient["rel_path"]) if ambient else ""
         measures_url = asset_url(measures["rel_path"]) if measures else ""
+        cover_url = _first_real_photo(ambient_url, white_url, measures_url)
 
         cadastro = cadastro_records.get(str(code), {})
         merged_name = str(cadastro.get("name") or record.get("name") or f"Produto {code}").strip()
         merged_description = str(cadastro.get("description") or "").strip()
-        merged_specs = str(cadastro.get("specs") or "").strip()
+        merged_specs = resolve_technical_specs(
+            code=code,
+            current_specs=cadastro.get("specs"),
+            name=merged_name,
+            description=merged_description,
+            category=cadastro.get("category") or record.get("category") or "",
+            extra_fields={**record, **cadastro},
+        )
         cadastro_category = _normalize_category_label(str(cadastro.get("category") or ""))
         if cadastro_category:
             merged_category = cadastro_category
@@ -195,24 +210,26 @@ def list_local_products(
                 "Nome": merged_name,
                 "Descricao": merged_description,
                 "Categoria": merged_category,
-                "URLFoto": white_url,
+                "URLFoto": cover_url,
                 "Especificacoes": merged_specs,
-                "FotoBranco": white_url,
+                "FotoBranco": white_url or cover_url,
                 "FotoAmbient": ambient_url,
                 "FotoMedidas": measures_url,
             }
         )
 
     merged_products = merge_products_with_erp(products)
+    merged_products = merge_products_with_stock_sales(merged_products)
     if path_override is not None:
-        return merged_products
+        return merge_products_with_nitrolux(merged_products)
 
-    return _enrich_products_with_resolved_photos(
+    resolved_products = _enrich_products_with_resolved_photos(
         merged_products,
         local_index=index,
         get_stock_photo_records_for_codes=get_stock_photo_records_for_codes,
         asset_url=asset_url,
     )
+    return merge_products_with_nitrolux(resolved_products)
 
 
 def categorize_local_photos(
